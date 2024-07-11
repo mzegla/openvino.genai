@@ -219,8 +219,20 @@ class Sampler {
     }
 
     Token _greedy_sample(const std::vector<Token>& logit_vector) const {
-        auto out_token = std::max_element(logit_vector.begin(), logit_vector.end(), [](const Token& lhs, const Token& rhs) { return lhs.m_log_prob < rhs.m_log_prob; });
-        return *out_token;
+        size_t max_index = 0;
+        float max_value = 0.0;
+        float remaining_prob = 1.0;
+        for (const auto& logit : logit_vector) {
+            if (logit.m_log_prob > max_value) {
+                max_value = logit.m_log_prob;
+                max_index = logit.m_index;
+                // early stop, if our max value is greater than the remaining possible probability we will not find a bigger value in the remaining subset
+                if (max_value > remaining_prob)
+                    break; 
+            }
+            remaining_prob -= logit.m_log_prob;
+        }
+        return logit_vector[max_index];
     }
 
     std::vector<Token> _multinomial_sample(const std::vector<Token>& logit_vector, size_t num_tokens_per_sequence) {
