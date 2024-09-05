@@ -89,6 +89,13 @@ std::vector<int64_t> wrap_tokens(const std::vector<int64_t>& tokens, const std::
     std::vector<int64_t> all_tokens = prefix_tokens;
     all_tokens.insert(all_tokens.end(), tokens.begin(), tokens.end());
     all_tokens.insert(all_tokens.end(), suffix_tokens.begin(), suffix_tokens.end());
+    std::cout << "Prefix token: " << prefix_tokens[0] << "\n";
+    std::cout << "Suffix token: " << suffix_tokens[0] << "\n";
+    std::cout << "All tokens: ";
+    for (auto token: all_tokens) {
+        std::cout << token << " ";
+    }
+    std::cout << std::endl;
     return all_tokens;
 }
 
@@ -100,6 +107,8 @@ std::string clean_wrapped_text(const std::string& wrapped_text, const std::strin
     auto clean_text_start = prefix_pos + prefix.size();
     auto clean_text_length = suffix_pos - clean_text_start;
     std::string clean_text = wrapped_text.substr(clean_text_start, clean_text_length);
+    std::cout << "Wrapped text: \"" << wrapped_text << "\"\n";
+    std::cout << "Clean text: \"" << clean_text << "\"\n"; 
     return clean_text;
 }
 
