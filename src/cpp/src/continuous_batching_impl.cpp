@@ -452,19 +452,27 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_fill_prompt_log_probs(
             int64_t token_id = sequence_group->get_prompt_ids()[token_id_offset];
             float token_logit = token_logits[token_id];
 
-            // find max value for log softmax
-            float max_value = -std::numeric_limits<float>::infinity();
-            size_t max_index = 0;
+            size_t m = 32;
+            std::vector<float> top_values(m, -std::numeric_limits<float>::infinity());
+            std::vector<size_t> top_indices(m, 0);
+
             for (size_t i = 0; i < vocab_size; ++i) {
-                if (token_logits[i] > max_value) {
-                    max_value = token_logits[i];
-                    max_index = i;
+                if (token_logits[i] > top_values.back()) {
+                    top_values.back() = token_logits[i];
+                    top_indices.back() = i;
+                    for (size_t j = top_values.size() - 1; j > 0 && top_values[j] > top_values[j - 1]; --j) {
+                        std::swap(top_values[j], top_values[j - 1]);
+                        std::swap(top_indices[j], top_indices[j - 1]);
+                    }
                 }
             }
 
-            // apply log softmax to token logit
+            // apply log softmax to max value
+            float max_value = top_values.front();
+            size_t max_index = top_indices.front();
+
             float log_sum = std::log(std::accumulate(
-                token_logits, token_logits + vocab_size, 0.0f, [max_value](float accumulated, float to_add) {
+                top_values.begin(), top_values.end(), 0.0f, [max_value](float accumulated, float to_add) {
                     return accumulated + std::exp(to_add - max_value);
             }));
 
