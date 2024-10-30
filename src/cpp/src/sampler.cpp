@@ -496,20 +496,41 @@ Logits Sampler::_get_logit_vector(ov::Tensor logits, size_t batch_idx, size_t to
 Token Sampler::_greedy_sample(const Logits& logits) const {
     // For greedy sampling we do not expect sorting or shrinking considered tokens
     // so we can operate directly on the data buffer
-    float max_value = -std::numeric_limits<float>::infinity();
-    size_t max_index = 0;
+    
+    // Experimental approximative approach to find M largest values in the logits and then apply log softmax to them instead of the whole logits buffer.
+    size_t m = 64;
+    std::vector<float> top_values(m, -std::numeric_limits<float>::infinity());
+    std::vector<size_t> top_indices(m, 0);
+
     for (size_t i = 0; i < logits.m_size; ++i) {
-        if (logits.m_data[i] > max_value) {
-            max_value = logits.m_data[i];
-            max_index = i;
+        if (logits.m_data[i] > top_values.back()) {
+            top_values.back() = logits.m_data[i];
+            top_indices.back() = i;
+            for (size_t j = top_values.size() - 1; j > 0 && top_values[j] > top_values[j - 1]; --j) {
+                std::swap(top_values[j], top_values[j - 1]);
+                std::swap(top_indices[j], top_indices[j - 1]);
+            }
         }
     }
 
     // apply log softmax to max value
+    float max_value = top_values.front();
+    size_t max_index = top_indices.front();
+
     float log_sum = std::log(std::accumulate(
+        top_values.begin(), top_values.end(), 0.0f, [max_value](float accumulated, float to_add) {
+            return accumulated + std::exp(to_add - max_value);
+    }));
+    /* Uncomment to check how close the approximative approach is to the exact log sum
+
+    float log_sum2 = std::log(std::accumulate(
         logits.m_data, logits.m_data + logits.m_size, 0.0f, [max_value](float accumulated, float to_add) {
             return accumulated + std::exp(to_add - max_value);
     }));
+
+    std::cout << "approx_log_sum: " << log_sum << " exact_log_sum: " << log_sum2 << " similarity: " << (log_sum / log_sum2) * 100 << "%" << std::endl;
+    
+    */
     max_value = -log_sum;
 
     return Token(max_value, max_index);
