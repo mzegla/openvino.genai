@@ -23,6 +23,8 @@ import openvino_genai as ov_genai
 import queue
 from transformers.generation.streamers import BaseStreamer
 
+GENAI_SUPPORTED_VLM = ["llava", "llava-next", "internvl-chat", "minicpmv"]
+
 
 def generate_simplified(self, *args, **kwargs):
     if len(args):
@@ -181,7 +183,7 @@ def create_text_gen_model(model_path, device, **kwargs):
     else:
         if kwargs.get("genai", True) and is_genai_available(log_msg=True):
             if model_class not in [OV_MODEL_CLASSES_MAPPING[default_model_type], OV_MODEL_CLASSES_MAPPING["mpt"], OV_MODEL_CLASSES_MAPPING["chatglm"]]:
-                log.warning("OpenVINO GenAI based benchmarking is not available for {model_type}. Will be switched to default benchmarking")
+                log.warning(f"OpenVINO GenAI based benchmarking is not available for {model_type}. Will be switched to default benchmarking")
             else:
                 log.info("Selected OpenVINO GenAI for benchmarking")
                 return create_genai_text_gen_model(model_path, device, ov_config, **kwargs)
@@ -361,12 +363,13 @@ def create_genai_image_gen_model(model_path, device, ov_config, **kwargs):
     import openvino_genai
 
     class PerfCollector:
-        def __init__(self) -> types.NoneType:
+        def __init__(self, main_model_name="unet") -> types.NoneType:
             self.iteration_time = []
             self.start_time = time.perf_counter()
             self.duration = -1
+            self.main_model_name = main_model_name
 
-        def __call__(self, step, latents):
+        def __call__(self, step, num_steps, latents):
             self.iteration_time.append(time.perf_counter() - self.start_time)
             self.start_time = time.perf_counter()
             return False
@@ -403,8 +406,6 @@ def create_genai_image_gen_model(model_path, device, ov_config, **kwargs):
         def get_vae_decoder_step_count(self):
             return 1
 
-    callback = PerfCollector()
-
     adapter_config = get_lora_config(kwargs.get("lora", None), kwargs.get("lora_alphas", []))
     if adapter_config:
         ov_config['adapters'] = adapter_config
@@ -414,11 +415,17 @@ def create_genai_image_gen_model(model_path, device, ov_config, **kwargs):
         data = json.load(f)
 
     model_class_name = data.get("_class_name", "")
+    main_model_name = "unet" if "unet" in data else "transformer"
+    callback = PerfCollector(main_model_name)
+
+    orig_tokenizer = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
+    callback.orig_tokenizer = orig_tokenizer
 
     start = time.perf_counter()
 
     scheduler_type = data.get("scheduler", ["", ""])[1]
-    if (scheduler_type not in ["LCMScheduler", "DDIMScheduler", "LMSDiscreteScheduler", "EulerDiscreteScheduler", "FlowMatchEulerDiscreteScheduler"]):
+    if (scheduler_type not in ["LCMScheduler", "DDIMScheduler", "PNDMScheduler", "LMSDiscreteScheduler", "EulerDiscreteScheduler",
+                               "FlowMatchEulerDiscreteScheduler", "EulerAncestralDiscreteScheduler"]):
         scheduler = openvino_genai.Scheduler.from_config(model_path / "scheduler/scheduler_config.json", openvino_genai.Scheduler.Type.DDIM)
         log.warning(f'Type of scheduler {scheduler_type} is unsupported. Please, be aware that it will be replaced to DDIMScheduler')
 
@@ -523,6 +530,85 @@ def create_speech_2txt_model(model_path, device, **kwargs):
     return pipe, processor, from_pretrained_time, False
 
 
+def get_vlm_processor(model_path):
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    model_type = config.model_type
+    if model_type == "llava-qwen2":
+        processor = AutoProcessor.from_pretrained(config.mm_vision_tower, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        preprocessors = {"processor": processor, "tokenizer": tokenizer}
+    elif model_type == "internvl_chat":
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        preprocessors = {"processor": None, "tokenizer": tokenizer, "config": config}
+    else:
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        preprocessors = {"processor": processor, "tokenizer": processor}
+    return preprocessors
+
+
+def create_genai_image_text_gen_model(model_path, device, ov_config, **kwargs):
+    import openvino_genai
+
+    if not (model_path / "openvino_tokenizer.xml").exists() or not (model_path / "openvino_detokenizer.xml").exists():
+        convert_ov_tokenizer(model_path)
+
+    processor_config = get_vlm_processor(model_path)
+
+    start = time.perf_counter()
+    llm_pipe = openvino_genai.VLMPipeline(model_path, device.upper(), **ov_config)
+    end = time.perf_counter()
+    log.info(f'Pipeline initialization time: {end - start:.2f}s')
+
+    return llm_pipe, processor_config, end - start, None, True
+
+
+def create_image_text_gen_model(model_path, device, **kwargs):
+    model_path = Path(model_path)
+    # specify the model path
+    if model_path.name.endswith('xml'):
+        model_path = model_path.parents[2]
+
+    ov_config = kwargs['config']
+
+    model_path_existed = Path(model_path).exists()
+    # load model
+    if not model_path_existed:
+        raise RuntimeError(f'==Failure ==: model path:{model_path} does not exist')
+    else:
+        remote_code = False
+        try:
+            model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
+        except Exception:
+            model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            remote_code = True
+        if kwargs.get("genai", True) and is_genai_available(log_msg=True):
+            if model_config.model_type.replace("_", "-") in GENAI_SUPPORTED_VLM:
+                log.info("Selected OpenVINO GenAI for benchmarking")
+                return create_genai_image_text_gen_model(model_path, device, ov_config, **kwargs)
+            else:
+                log.warning(
+                    f"Model type `{model_config.model_type}` is not supported by OpenVINO GenAI. "
+                    "Benchmark will be switched to Optimum Intel pipeline realization"
+                )
+
+        log.info("Selected Optimum Intel for benchmarking")
+        model_class = OV_MODEL_CLASSES_MAPPING.get(DEFAULT_MODEL_CLASSES[kwargs['use_case']])
+        start = time.perf_counter()
+        ov_model = model_class.from_pretrained(
+            model_path,
+            device=device,
+            ov_config=ov_config,
+            config=model_config,
+            trust_remote_code=remote_code
+        )
+        end = time.perf_counter()
+    bench_hook = get_bench_hook(kwargs['num_beams'], ov_model)
+    from_pretrained_time = end - start
+    log.info(f'From pretrained time: {from_pretrained_time:.2f}s')
+    processor_config = get_vlm_processor(model_path)
+    return ov_model, processor_config, from_pretrained_time, bench_hook, False
+
+
 def is_genai_available(log_msg=False):
     import importlib
     try:
@@ -619,7 +705,7 @@ class GenaiChunkStreamer(ov_genai.StreamerBase):
                 word = text[self.print_len:]
                 self.tokens_cache = []
                 self.print_len = 0
-            elif len(text) >= 3 and text[-3:] == chr(65533):
+            elif len(text) >= 3 and text[-1] == chr(65533):
                 # Don't print incomplete text.
                 pass
             elif len(text) > self.print_len:

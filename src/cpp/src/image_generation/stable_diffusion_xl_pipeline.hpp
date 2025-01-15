@@ -74,18 +74,18 @@ public:
         }
 
         // Temporary fix for GPU
-        ov::AnyMap updated_roperties = properties;
+        ov::AnyMap updated_properties = properties;
         if (device.find("GPU") != std::string::npos &&
-            updated_roperties.find("INFERENCE_PRECISION_HINT") == updated_roperties.end()) {
-            updated_roperties["INFERENCE_PRECISION_HINT"] = ov::element::f32;
+            updated_properties.find("INFERENCE_PRECISION_HINT") == updated_properties.end()) {
+            updated_properties["INFERENCE_PRECISION_HINT"] = ov::element::f32;
         }
 
         const std::string vae = data["vae"][1].get<std::string>();
         if (vae == "AutoencoderKL") {
             if (m_pipeline_type == PipelineType::TEXT_2_IMAGE)
-                m_vae = std::make_shared<AutoencoderKL>(root_dir / "vae_decoder", device, properties);
+                m_vae = std::make_shared<AutoencoderKL>(root_dir / "vae_decoder", device, updated_properties);
             else if (m_pipeline_type == PipelineType::IMAGE_2_IMAGE || m_pipeline_type == PipelineType::INPAINTING) {
-                m_vae = std::make_shared<AutoencoderKL>(root_dir / "vae_encoder", root_dir / "vae_decoder", device, properties);
+                m_vae = std::make_shared<AutoencoderKL>(root_dir / "vae_encoder", root_dir / "vae_decoder", device, updated_properties);
             } else {
                 OPENVINO_ASSERT("Unsupported pipeline type");
             }
@@ -114,6 +114,15 @@ public:
         initialize_generation_config("StableDiffusionXLPipeline");
         // here we implicitly imply that force_zeros_for_empty_prompt is set to True as by default in diffusers
         m_force_zeros_for_empty_prompt = true;
+    }
+
+    StableDiffusionXLPipeline(PipelineType pipeline_type, const StableDiffusionXLPipeline& pipe) :
+        StableDiffusionXLPipeline(pipe) {
+        OPENVINO_ASSERT(!pipe.is_inpainting_model(), "Cannot create ",
+            pipeline_type == PipelineType::TEXT_2_IMAGE ? "'Text2ImagePipeline'" : "'Image2ImagePipeline'", " from InpaintingPipeline with inpainting model");
+
+        m_pipeline_type = pipeline_type;
+        initialize_generation_config("StableDiffusionXLPipeline");
     }
 
     void reshape(const int num_images_per_prompt, const int height, const int width, const float guidance_scale) override {
@@ -291,8 +300,13 @@ private:
         const auto& unet_config = m_unet->get_config();
         const size_t vae_scale_factor = m_vae->get_vae_scale_factor();
 
-        m_generation_config.height = unet_config.sample_size * vae_scale_factor;
-        m_generation_config.width = unet_config.sample_size * vae_scale_factor;
+        m_generation_config = ImageGenerationConfig();
+
+        // in case of image to image, the shape is computed based on initial image
+        if (m_pipeline_type != PipelineType::IMAGE_2_IMAGE) {
+            m_generation_config.height = unet_config.sample_size * vae_scale_factor;
+            m_generation_config.width = unet_config.sample_size * vae_scale_factor;
+        }
 
         if (class_name == "StableDiffusionXLPipeline" || class_name == "StableDiffusionXLImg2ImgPipeline" || class_name == "StableDiffusionXLInpaintPipeline") {
             if (m_pipeline_type == PipelineType::TEXT_2_IMAGE) {
@@ -306,7 +320,7 @@ private:
             } else if (m_pipeline_type == PipelineType::INPAINTING) {
                 m_generation_config.guidance_scale = 7.5f;
                 m_generation_config.num_inference_steps = 50;
-                m_generation_config.strength == 0.9999f;
+                m_generation_config.strength = 0.9999f;
             }
         } else {
             OPENVINO_THROW("Unsupported class_name '", class_name, "'. Please, contact OpenVINO GenAI developers");

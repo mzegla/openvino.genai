@@ -112,9 +112,14 @@ public:
         const ov::AnyMap& properties = {}
     );
 
-    OPENVINO_DEPRECATED("Please, specify device explicitly when create LLMPipeline. This overload will be removed in 2025.0.0 release")
-    explicit LLMPipeline(const std::filesystem::path& path) :
-        LLMPipeline(path, "CPU") { }
+    LLMPipeline(
+        const std::string& model_str,
+        const ov::Tensor& weights_tensor,
+        const ov::genai::Tokenizer& tokenizer,
+        const std::string& device,
+        const ov::AnyMap& properties = {},
+        const ov::genai::GenerationConfig& generation_config = {}
+    );
 
     /**
     * @brief Constructs an LLMPipeline from xml/bin files, tokenizers and configuration in the same dir.
@@ -144,7 +149,7 @@ public:
     LLMPipeline(
         const ov::InferRequest& request,
         const ov::genai::Tokenizer& tokenizer,
-        OptionalGenerationConfig generation_config=std::nullopt
+        OptionalGenerationConfig generation_config = std::nullopt
     );
 
     /**
@@ -162,10 +167,6 @@ public:
         const std::string& device,
         const ov::AnyMap& properties = {}
     );
-
-    OPENVINO_DEPRECATED("Please, specify device explicitly when create LLMPipeline. This overload will be removed in 2025.0.0 release")
-    LLMPipeline(const std::filesystem::path& models_path, const ov::genai::Tokenizer& tokenizer) :
-        LLMPipeline(models_path, tokenizer, "CPU") { }
 
     ~LLMPipeline();
 
@@ -202,7 +203,7 @@ public:
 
     DecodedResults operator()(
         StringInputs inputs,
-        OptionalGenerationConfig generation_config=std::nullopt,
+        OptionalGenerationConfig generation_config = std::nullopt,
         StreamerVariant streamer=std::monostate()
     ) {
         return generate(inputs, generation_config, streamer);
@@ -275,6 +276,14 @@ OPENVINO_GENAI_EXPORTS std::pair<std::string, Any> streamer(StreamerVariant func
 OPENVINO_GENAI_EXPORTS std::pair<std::string, Any> generation_config(const GenerationConfig& config);
 
 OPENVINO_GENAI_EXPORTS std::pair<std::string, Any> draft_model(
+    std::string& model_str,
+    ov::Tensor& weights_tensor,
+    const ov::genai::Tokenizer& tokenizer,
+    const std::string& device = {},
+    const ov::AnyMap& properties = {},
+    const ov::genai::GenerationConfig& generation_config = {});
+
+OPENVINO_GENAI_EXPORTS std::pair<std::string, Any> draft_model(
     const std::filesystem::path& models_path,
     const std::string& device = {},
     const ov::AnyMap& properties = {});
@@ -302,6 +311,13 @@ inline std::pair<std::string, Any> draft_model(
 * And create LLMPipeline instance with this config.
 */
 static constexpr ov::Property<SchedulerConfig> scheduler_config{"scheduler_config"};
+
+/**
+* @brief enable prompt_lookup property serves to activate prompt lookup decoding.
+* Set `true` to activate this mode.
+* And create LLMPipeline instance with this config.
+*/
+static constexpr ov::Property<bool> prompt_lookup{"prompt_lookup"};
 
 }  // namespace genai
 }  // namespace ov

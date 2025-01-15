@@ -4,7 +4,6 @@
 #pragma once
 
 #include <cassert>
-#include <ctime>
 
 #include "image_generation/diffusion_pipeline.hpp"
 #include "image_generation/numpy_utils.hpp"
@@ -26,6 +25,10 @@ void padding_right(ov::Tensor src, ov::Tensor res) {
     OPENVINO_ASSERT(src_shape.size() == 3 && src_shape.size() == res_shape.size(), "Rank of tensors within 'padding_right' must be 3");
     OPENVINO_ASSERT(src_shape[0] == res_shape[0] && src_shape[1] == res_shape[1], "Tensors for padding_right must have the same dimensions");
 
+    // since torch.nn.functional.pad can also perform trancation in case of negative pad size value
+    // we need to find minimal amoung src and res and respect it
+    size_t min_size = std::min(src_shape[2], res_shape[2]);
+
     const float* src_data = src.data<const float>();
     float* res_data = res.data<float>();
 
@@ -34,8 +37,11 @@ void padding_right(ov::Tensor src, ov::Tensor res) {
             size_t offset_1 = (i * res_shape[1] + j) * res_shape[2];
             size_t offset_2 = (i * src_shape[1] + j) * src_shape[2];
 
-            std::memcpy(res_data + offset_1, src_data + offset_2, src_shape[2] * sizeof(float));
-            std::fill_n(res_data + offset_1 + src_shape[2], res_shape[2] - src_shape[2], 0.0f);
+            std::memcpy(res_data + offset_1, src_data + offset_2, min_size * sizeof(float));
+            if (res_shape[2] > src_shape[2]) {
+                // peform actual padding if required
+                std::fill_n(res_data + offset_1 + src_shape[2], res_shape[2] - src_shape[2], 0.0f);
+            }
         }
     }
 }
@@ -131,10 +137,17 @@ public:
 
         set_scheduler(Scheduler::from_config(root_dir / "scheduler/scheduler_config.json"));
 
+        // Temporary fix for GPU
+        ov::AnyMap updated_properties = properties;
+        if (device.find("GPU") != std::string::npos &&
+            updated_properties.find("INFERENCE_PRECISION_HINT") == updated_properties.end()) {
+            updated_properties["INFERENCE_PRECISION_HINT"] = ov::element::f32;
+        }
+
         const std::string text_encoder = data["text_encoder"][1].get<std::string>();
         if (text_encoder == "CLIPTextModelWithProjection") {
             m_clip_text_encoder_1 =
-                std::make_shared<CLIPTextModelWithProjection>(root_dir / "text_encoder", device, properties);
+                std::make_shared<CLIPTextModelWithProjection>(root_dir / "text_encoder", device, updated_properties);
         } else {
             OPENVINO_THROW("Unsupported '", text_encoder, "' text encoder type");
         }
@@ -142,7 +155,7 @@ public:
         const std::string text_encoder_2 = data["text_encoder_2"][1].get<std::string>();
         if (text_encoder_2 == "CLIPTextModelWithProjection") {
             m_clip_text_encoder_2 =
-                std::make_shared<CLIPTextModelWithProjection>(root_dir / "text_encoder_2", device, properties);
+                std::make_shared<CLIPTextModelWithProjection>(root_dir / "text_encoder_2", device, updated_properties);
         } else {
             OPENVINO_THROW("Unsupported '", text_encoder_2, "' text encoder type");
         }
@@ -151,7 +164,7 @@ public:
         if (!text_encoder_3_json.is_null()) {
             const std::string text_encoder_3 = text_encoder_3_json.get<std::string>();
             if (text_encoder_3 == "T5EncoderModel") {
-                m_t5_text_encoder = std::make_shared<T5EncoderModel>(root_dir / "text_encoder_3", device, properties);
+                m_t5_text_encoder = std::make_shared<T5EncoderModel>(root_dir / "text_encoder_3", device, updated_properties);
             } else {
                 OPENVINO_THROW("Unsupported '", text_encoder_3, "' text encoder type");
             }
@@ -167,9 +180,9 @@ public:
         const std::string vae = data["vae"][1].get<std::string>();
         if (vae == "AutoencoderKL") {
             if (m_pipeline_type == PipelineType::TEXT_2_IMAGE)
-                m_vae = std::make_shared<AutoencoderKL>(root_dir / "vae_decoder", device, properties);
+                m_vae = std::make_shared<AutoencoderKL>(root_dir / "vae_decoder", device, updated_properties);
             else if (m_pipeline_type == PipelineType::IMAGE_2_IMAGE || m_pipeline_type == PipelineType::INPAINTING) {
-                m_vae = std::make_shared<AutoencoderKL>(root_dir / "vae_encoder", root_dir / "vae_decoder", device, properties);
+                m_vae = std::make_shared<AutoencoderKL>(root_dir / "vae_encoder", root_dir / "vae_decoder", device, updated_properties);
             } else {
                 OPENVINO_ASSERT("Unsupported pipeline type");
             }
@@ -208,6 +221,15 @@ public:
           m_clip_text_encoder_2(std::make_shared<CLIPTextModelWithProjection>(clip_text_model_2)),
           m_vae(std::make_shared<AutoencoderKL>(vae)),
           m_transformer(std::make_shared<SD3Transformer2DModel>(transformer)) {
+        initialize_generation_config("StableDiffusion3Pipeline");
+    }
+
+    StableDiffusion3Pipeline(PipelineType pipeline_type, const StableDiffusion3Pipeline& pipe) :
+        StableDiffusion3Pipeline(pipe) {
+        OPENVINO_ASSERT(!pipe.is_inpainting_model(), "Cannot create ",
+            pipeline_type == PipelineType::TEXT_2_IMAGE ? "'Text2ImagePipeline'" : "'Image2ImagePipeline'", " from InpaintingPipeline with inpainting model");
+
+        m_pipeline_type = pipeline_type;
         initialize_generation_config("StableDiffusion3Pipeline");
     }
 
@@ -419,28 +441,23 @@ public:
         ImageGenerationConfig generation_config = m_generation_config;
         generation_config.update_generation_config(properties);
 
-        if (!initial_image) {
-            // in case of typical text to image generation, we need to ignore 'strength'
-            generation_config.strength = 1.0f;
+        // Use callback if defined
+        std::function<bool(size_t, size_t, ov::Tensor&)> callback = nullptr;
+        auto callback_iter = properties.find(ov::genai::callback.name());
+        if (callback_iter != properties.end()) {
+            callback = callback_iter->second.as<std::function<bool(size_t, size_t, ov::Tensor&)>>();
         }
 
         const auto& transformer_config = m_transformer->get_config();
         const size_t vae_scale_factor = m_vae->get_vae_scale_factor();
-        const size_t batch_size_multiplier = do_classifier_free_guidance(generation_config.guidance_scale)
-                                                 ? 2
-                                                 : 1;  // Transformer accepts 2x batch in case of CFG
+        const size_t batch_size_multiplier = do_classifier_free_guidance(generation_config.guidance_scale) ? 2 : 1;  // Transformer accepts 2x batch in case of CFG
 
         if (generation_config.height < 0)
-            generation_config.height = transformer_config.sample_size * vae_scale_factor;
+            compute_dim(generation_config.height, initial_image, 1 /* assume NHWC */);
         if (generation_config.width < 0)
-            generation_config.width = transformer_config.sample_size * vae_scale_factor;
+            compute_dim(generation_config.width, initial_image, 2 /* assume NHWC */);
 
         check_inputs(generation_config, initial_image);
-
-        if (generation_config.generator == nullptr) {
-            uint32_t seed = time(NULL);
-            generation_config.generator = std::make_shared<CppStdGenerator>(seed);
-        }
 
         // 3. Prepare timesteps
         m_scheduler->set_timesteps(generation_config.num_inference_steps, generation_config.strength);
@@ -459,14 +476,6 @@ public:
 
         // 6. Denoising loop
         ov::Tensor noisy_residual_tensor(ov::element::f32, {});
-
-        // Use callback if defined
-        std::function<bool(size_t, ov::Tensor&)> callback;
-        auto callback_iter = properties.find(ov::genai::callback.name());
-        bool do_callback = callback_iter != properties.end();
-        if (do_callback) {
-            callback = callback_iter->second.as<std::function<bool(size_t, ov::Tensor&)>>();
-        }
 
         for (size_t inference_step = 0; inference_step < timesteps.size(); ++inference_step) {
             // concat the same latent twice along a batch dimension in case of CFG
@@ -503,10 +512,8 @@ public:
             auto scheduler_step_result = m_scheduler->step(noisy_residual_tensor, latent, inference_step, generation_config.generator);
             latent = scheduler_step_result["latent"];
 
-            if (do_callback) {
-                if (callback(inference_step, latent)) {
-                    return ov::Tensor(ov::element::u8, {});
-                }
+            if (callback && callback(inference_step, timesteps.size(), latent)) {
+                return ov::Tensor(ov::element::u8, {});
             }
         }
 
@@ -518,6 +525,29 @@ public:
     }
 
 private:
+    bool is_inpainting_model() const {
+        assert(m_transformer != nullptr);
+        assert(m_vae != nullptr);
+        return m_transformer->get_config().in_channels == (m_vae->get_config().latent_channels * 2 + 1);
+    }
+
+    void compute_dim(int64_t & generation_config_value, ov::Tensor initial_image, int dim_idx) {
+        const size_t vae_scale_factor = m_vae->get_vae_scale_factor();
+        const auto& transformer_config = m_transformer->get_config();
+
+        // in case of image to image generation_config_value is just ignored and computed based on initial image
+        if (m_pipeline_type == PipelineType::IMAGE_2_IMAGE) {
+            OPENVINO_ASSERT(initial_image, "Initial image is empty for image to image pipeline");
+            ov::Shape shape = initial_image.get_shape();
+            int64_t dim_val = shape[dim_idx];
+
+            generation_config_value = dim_val - (dim_val % vae_scale_factor);
+        }
+
+        if (generation_config_value < 0)
+            generation_config_value = transformer_config.sample_size * vae_scale_factor;
+    }
+
     bool do_classifier_free_guidance(float guidance_scale) const {
         return guidance_scale > 1.0;
     }
@@ -529,8 +559,13 @@ private:
         const auto& transformer_config = m_transformer->get_config();
         const size_t vae_scale_factor = m_vae->get_vae_scale_factor();
 
-        m_generation_config.height = transformer_config.sample_size * vae_scale_factor;
-        m_generation_config.width = transformer_config.sample_size * vae_scale_factor;
+        m_generation_config = ImageGenerationConfig();
+
+        // in case of image to image, the shape is computed based on initial image
+        if (m_pipeline_type != PipelineType::IMAGE_2_IMAGE) {
+            m_generation_config.height = transformer_config.sample_size * vae_scale_factor;
+            m_generation_config.width = transformer_config.sample_size * vae_scale_factor;
+        }
 
         if (class_name == "StableDiffusion3Pipeline" || class_name == "StableDiffusion3Img2ImgPipeline" || class_name == "StableDiffusion3InpaintPipeline") {
             m_generation_config.guidance_scale = 7.0f;
