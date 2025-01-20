@@ -34,6 +34,7 @@ namespace {
 namespace opp = ov::pass::pattern;
 class TransposeValueTensors : public ov::pass::MatcherPass {
 public:
+    OPENVINO_MATCHER_PASS_RTTI("TransposeValueTensors");
     struct Context {
         std::vector<std::shared_ptr<ov::opset13::Parameter>> new_params;
         std::vector<std::shared_ptr<ov::opset13::Parameter>> old_params;
@@ -95,7 +96,7 @@ public:
 
 class ScaledDotProductAttentionDecomposition : public ov::pass::MatcherPass {
 public:
-    OPENVINO_RTTI("ScaledDotProductAttentionDecomposition", "0");
+    OPENVINO_MATCHER_PASS_RTTI("ScaledDotProductAttentionDecomposition");
     ScaledDotProductAttentionDecomposition() {
         auto pattern_node = ov::pass::pattern::wrap_type<ov::op::v13::ScaledDotProductAttention>();
 
@@ -671,6 +672,7 @@ enum StaticPipelineKind {
     STATEFUL,
     STATELESS
 };
+
 StaticPipelineKind str_to_pipeline(const std::string& str) {
     if (str == "STATEFUL") {
         return StaticPipelineKind::STATEFUL;
@@ -769,9 +771,6 @@ void StatefulLLMPipeline::updateStatefulConfig(
     rename_key(pipeline_config, "PREFILL_CONFIG", "NPUW_LLM_PREFILL_CONFIG");
     rename_key(pipeline_config, "GENERATE_CONFIG", "NPUW_LLM_GENERATE_CONFIG");
     rename_key(pipeline_config, "GENERATE_HINT", "NPUW_LLM_GENERATE_HINT");
-
-    // Replace CACHE_DIR option if NPUW is enabled
-    set_npuw_cache_dir(pipeline_config);
 }
 
 std::shared_ptr<ov::CompiledModel> StatefulLLMPipeline::setupAndCompileModel(
@@ -937,7 +936,7 @@ EncodedResults StatefulLLMPipeline::generate(
     m_request.set_tensor("input_ids", ov::Tensor(ov::element::i64, ov::Shape{1,1},  reinterpret_cast<void*>(&input_ids_data)));
     m_request.set_tensor("position_ids", ov::Tensor(ov::element::i64, ov::Shape{1,1}, reinterpret_cast<void*>(&position_ids_data)));
 
-    while (sequence_group->is_running()) {
+    while (sequence_group->is_running() && !sequence_group->handle_dropped()) {
         // KV Cache is full, no further generation is possible
         if (position_ids_data + 1 == m_kvcache_total) {
             sequence_group->set_out_of_memory();
@@ -961,12 +960,11 @@ EncodedResults StatefulLLMPipeline::generate(
         raw_perf_counters.m_new_token_times.emplace_back(std::chrono::steady_clock::now());
         raw_perf_counters.m_batch_sizes.emplace_back(batch_size);
 
-        SamplerOutput sampler_output = m_sampler.sample(
-            {sequence_group}, m_request.get_tensor("logits"));
+        SamplerOutput sampler_output = m_sampler.sample({sequence_group}, m_request.get_tensor("logits"));
         stream_generated_tokens(streamer_ptr, handle);
     }
 
-    if (streamer_ptr) {
+    if (streamer_ptr) { // push streamer's cache
         streamer_ptr->end();
     }
 
@@ -1443,7 +1441,7 @@ EncodedResults StatelessLLMPipeline::generate(
     std::fill(attention_mask_data, attention_mask_data + m_kvcache_desc.num_stored_tokens - 1u, 1u);
     attention_mask_data[m_kvcache_desc.total_size - 1] = 1u;
 
-    while (sequence_group->is_running()) {
+    while (sequence_group->is_running() && !sequence_group->handle_dropped()) {
         sequence_group->schedule_tokens(1);
         const auto running_sequences = sequence_group->get_running_sequences();
         OPENVINO_ASSERT(running_sequences.size() == 1u);
@@ -1461,6 +1459,9 @@ EncodedResults StatelessLLMPipeline::generate(
         SamplerOutput sampler_output = m_sampler.sample(
             {sequence_group}, m_kvcache_request.get_tensor("logits"));
         stream_generated_tokens(streamer_ptr, handle);
+
+        if (sequence_group->handle_dropped())
+            break;
 
         // NB: KV-cache is full, further generation is impossible
         if (m_kvcache_desc.num_stored_tokens == m_kvcache_desc.total_size) {
@@ -1484,7 +1485,7 @@ EncodedResults StatelessLLMPipeline::generate(
         }
     }
 
-    if (streamer_ptr) {
+    if (streamer_ptr) { // push streamer's cache
         streamer_ptr->end();
     }
 
@@ -1510,7 +1511,7 @@ LLMPipelineFactory::create(const std::filesystem::path& models_path,
                            const std::string& device,
                            const ov::AnyMap& config) {
     auto properties = config;
-    const auto pipeline_mode = str_to_pipeline(pop_or_default(properties, "STATIC_PIPELINE", std::string("STATELESS")));
+    const auto pipeline_mode = str_to_pipeline(pop_or_default(properties, "STATIC_PIPELINE", std::string("STATEFUL")));
     if (pipeline_mode == StaticPipelineKind::STATEFUL) {
         return std::make_unique<ov::genai::static_llm::StatefulLLMPipeline>(models_path, tokenizer, device, properties);
     }
@@ -1531,7 +1532,7 @@ std::unique_ptr<LLMPipelineImplBase> LLMPipelineFactory::create(const std::share
                                                                 const ov::AnyMap& properties,
                                                                 const ov::genai::GenerationConfig& generation_config) {
     auto properties_copy = properties;
-    const auto pipeline_mode = str_to_pipeline(pop_or_default(properties_copy, "STATIC_PIPELINE", std::string("STATELESS")));
+    const auto pipeline_mode = str_to_pipeline(pop_or_default(properties_copy, "STATIC_PIPELINE", std::string("STATEFUL")));
     if (pipeline_mode == StaticPipelineKind::STATEFUL) {
         return std::make_unique<ov::genai::static_llm::StatefulLLMPipeline>(model,
                                                                             model_desc,
