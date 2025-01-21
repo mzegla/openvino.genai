@@ -786,6 +786,8 @@ SamplerOutput Sampler::sample(const std::vector<SequenceGroup::Ptr> & sequence_g
             if (sampling_params.is_greedy_decoding() || sampling_params.is_multinomial()) {
                 std::vector<Sequence::Ptr> running_sequences = sequence_group->get_running_sequences();
                 if (sampling_params.is_greedy_decoding()) {
+                    if (num_running_sequences != 1)
+                        std::cout << "Number of running sequences: " << num_running_sequences << std::endl;
                     OPENVINO_ASSERT(num_running_sequences == 1);
                 }
                 for (size_t running_sequence_id = 0; running_sequence_id < num_running_sequences; ++running_sequence_id) {
