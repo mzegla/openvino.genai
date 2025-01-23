@@ -1,7 +1,7 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-#include "text_callback_streamer.hpp"
+#include "openvino/genai/text_callback_streamer.hpp"
 #include "speculative_decoding_impl.hpp"
 #include "utils.hpp"
 #include "utils/paged_attention_transformations.hpp"

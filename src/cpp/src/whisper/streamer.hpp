@@ -5,7 +5,7 @@
 
 #include "openvino/genai/tokenizer.hpp"
 #include "openvino/genai/whisper_pipeline.hpp"
-#include "text_callback_streamer.hpp"
+#include "openvino/genai/text_callback_streamer.hpp"
 
 namespace ov {
 namespace genai {

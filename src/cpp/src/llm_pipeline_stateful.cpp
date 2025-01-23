@@ -6,7 +6,7 @@
 
 #include "lora_helper.hpp"
 #include "lm_encoding.hpp"
-#include "text_callback_streamer.hpp"
+#include "openvino/genai/text_callback_streamer.hpp"
 #include "utils.hpp"
 
 namespace ov::genai {

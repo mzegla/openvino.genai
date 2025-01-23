@@ -3,8 +3,6 @@
 
 #include "streamer.hpp"
 
-#include "text_callback_streamer.hpp"
-
 namespace ov {
 namespace genai {
 

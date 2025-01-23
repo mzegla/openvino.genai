@@ -25,7 +25,7 @@
 
 #include <jinja2cpp/user_callable.h>
 
-#include "text_callback_streamer.hpp"
+#include "openvino/genai/text_callback_streamer.hpp"
 #include "json_utils.hpp"
 #include "utils.hpp"
 

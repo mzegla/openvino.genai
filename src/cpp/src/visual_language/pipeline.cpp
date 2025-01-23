@@ -13,7 +13,7 @@
 #include "visual_language/embedding_model.hpp"
 
 #include "sampler.hpp"
-#include "text_callback_streamer.hpp"
+#include "openvino/genai/text_callback_streamer.hpp"
 #include "utils.hpp"
 #include "lm_encoding.hpp"
 
