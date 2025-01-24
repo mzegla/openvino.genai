@@ -25,6 +25,7 @@ bool GenerationHandleImpl::is_dropped() {
 }
 
 void GenerationHandleImpl::drop() {
+    std::cout << "GenerationHandle dropped" << std::endl;
     m_generation_stream->drop();
 }
 

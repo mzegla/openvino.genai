@@ -390,6 +390,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_free_non_running_reque
                 }
             }
             m_sampler->clear_request_info(request->get_request_id());
+            std::cout << "Removing request " << request->get_request_id() << std::endl;
             requests_iterator = m_requests.erase(requests_iterator);
         } else {
             requests_iterator++;
