@@ -1,3 +1,3 @@
 [submodule "thirdparty/openvino_tokenizers"]
     path = thirdparty/openvino_tokenizers
-    url = https://github.com/openvinotoolkit/openvino_tokenizers.git
+    url = https://github.com/mzegla/openvino_tokenizers.git
