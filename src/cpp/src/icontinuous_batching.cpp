@@ -213,12 +213,17 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(uint64_t re
                                         const std::vector<ov::Tensor>& rgbs,
                                         GenerationConfig sampling_params) {
     static ManualTimer timer("add_request::get_inputs_embeds");
-    OPENVINO_ASSERT(m_model_input_type == ModelInputType::EMBEDDINGS, "Model doesn't support embeddings.");
-    ov::genai::VLMPerfMetrics metrics;
-    m_inputs_embedder->set_apply_chat_template_status(sampling_params.apply_chat_template);
-    timer.start();
-    ov::Tensor inputs = m_inputs_embedder->get_inputs_embeds(prompt, rgbs, metrics);
-    timer.end();
+    static ov::Tensor inputs;
+    static bool first_call = true;
+    if (first_call) {
+        OPENVINO_ASSERT(m_model_input_type == ModelInputType::EMBEDDINGS, "Model doesn't support embeddings.");
+        ov::genai::VLMPerfMetrics metrics;
+        m_inputs_embedder->set_apply_chat_template_status(sampling_params.apply_chat_template);
+        timer.start();
+        inputs = m_inputs_embedder->get_inputs_embeds(prompt, rgbs, metrics);
+        timer.end();
+        first_call = false;
+    }
     return add_request(request_id, inputs, sampling_params);
 }
 
