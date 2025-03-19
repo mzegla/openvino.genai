@@ -235,7 +235,7 @@ EncodedImage VisionEncoderQwen2VL::encode(const ov::Tensor& image, const ov::Any
     std::memcpy(flattened_patches.data(), transposed_patches.data(), transposed_patches.get_byte_size());
 
     encoder.set_tensor("hidden_states", flattened_patches);
-    ManualTimer vision_encoder_timer("vision encoder inference");
+    static ManualTimer vision_encoder_timer("vision encoder inference");
     vision_encoder_timer.start();
     encoder.infer();
     vision_encoder_timer.end();
@@ -322,7 +322,7 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, c
     m_image_id = images_sequence.empty() ? m_image_id : *std::max_element(images_sequence.begin(), images_sequence.end()) + 1;
 
     ov::Tensor input_ids = get_encoded_input_ids(unified_prompt, metrics);
-    ManualTimer embedding_timer("text embedding inference");
+    static ManualTimer embedding_timer("text embedding inference");
     embedding_timer.start();
     ov::Tensor text_embeds = m_embedding->infer(input_ids);
     embedding_timer.end();
@@ -443,7 +443,7 @@ ov::Tensor InputsEmbedderQwen2VL::merge_text_and_image_embeddings_qwen2vl(
     vision_embeddings_merger.set_tensor("hidden_states", concatenated_images);
     vision_embeddings_merger.set_tensor("attention_mask", attention_mask);
     vision_embeddings_merger.set_tensor("rotary_pos_emb", rotary_pos_emb);
-    ManualTimer vision_embeddings_merger_timer("vision embeddings merger inference");
+    static ManualTimer vision_embeddings_merger_timer("vision embeddings merger inference");
     vision_embeddings_merger_timer.start();
     vision_embeddings_merger.infer();
     vision_embeddings_merger_timer.end();
