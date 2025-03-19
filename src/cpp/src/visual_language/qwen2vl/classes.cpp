@@ -475,6 +475,11 @@ ov::Tensor InputsEmbedderQwen2VL::merge_text_and_image_embeddings_qwen2vl(
             }
         }
     }
+    std::cout << "Shape of merged_embeds: ";
+    for (const auto& dim : merged_embeds.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
     return merged_embeds;
 }
 
