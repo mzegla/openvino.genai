@@ -172,6 +172,8 @@ ov::Tensor transpose_image_patches_qwen2vl(const ov::Tensor& reshaped_patches) {
 } // namespace
 
 EncodedImage VisionEncoderQwen2VL::encode(const ov::Tensor& image, const ov::AnyMap& config_map) {
+    static ManualTimer encode_call_timer("image encode");
+    encode_call_timer.start();
     CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(this->m_ireq_queue_vision_encoder.get());
     ov::InferRequest& encoder = infer_request_guard.get();
     ProcessorConfig config = utils::from_any_map(config_map, m_processor_config);
@@ -246,7 +248,7 @@ EncodedImage VisionEncoderQwen2VL::encode(const ov::Tensor& image, const ov::Any
     std::memcpy(image_features.data(), infer_output.data(), infer_output.get_byte_size());
 
     ImageSize resized_source_size{grid_h, grid_w};
-
+    encode_call_timer.end();
     return {std::move(image_features), resized_source_size};
 }
 
@@ -461,9 +463,11 @@ ov::Tensor InputsEmbedderQwen2VL::merge_text_and_image_embeddings_qwen2vl(
     }
 
     ov::Tensor rotary_pos_emb = get_rotary_pos_emb(images_grid_thw);
-
+    static ManualTimer vision_embeddings_merger_guard_timer("vision embeddings merger guard");
+    vision_embeddings_merger_guard_timer.start();
     CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(this->m_ireq_queue_vision_embeddings_merger.get());
     ov::InferRequest& vision_embeddings_merger = infer_request_guard.get();
+    vision_embeddings_merger_guard_timer.end();
     vision_embeddings_merger.set_tensor("hidden_states", concatenated_images);
     vision_embeddings_merger.set_tensor("attention_mask", attention_mask);
     vision_embeddings_merger.set_tensor("rotary_pos_emb", rotary_pos_emb);
