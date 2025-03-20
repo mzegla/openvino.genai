@@ -35,6 +35,7 @@ public:
         for (size_t i = 0; i < length; i++) {
             m_data.emplace_back(std::move(create_fn()));
         }
+        std::cout << "CircularBufferQueue created with length: " << length << std::endl;
     }
 
     CircularBufferQueue(const CircularBufferQueue&) = delete;

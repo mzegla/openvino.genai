@@ -412,6 +412,20 @@ ov::Tensor InputsEmbedderQwen2VL::merge_text_and_image_embeddings_qwen2vl(
     const std::vector<ov::Tensor>& image_embeds,
     const std::vector<std::array<size_t, 3>> images_grid_thw,
     const int64_t image_pad_token_id) {
+
+    std::cout << "Shape of text_embeds: ";
+    for (const auto& dim : text_embeds.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
+
+    std::cout << "Shape of image_embeds: ";
+    for (const auto& embed : image_embeds) {
+        for (const auto& dim : embed.get_shape()) {
+            std::cout << dim << " ";
+        }
+        std::cout << std::endl;
+    }
     // Calculate cumulative sequence lengths for attention mask
     std::vector<int32_t> cu_seqlens;
     cu_seqlens.push_back(0);
