@@ -333,10 +333,16 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, c
     m_image_id = images_sequence.empty() ? m_image_id : *std::max_element(images_sequence.begin(), images_sequence.end()) + 1;
     reorder_timer.end();
 
+    std::cout << "Unified prompt: " << unified_prompt << std::endl;
     static ManualTimer input_ids_timer("input ids encoding");
     input_ids_timer.start();
     ov::Tensor input_ids = get_encoded_input_ids(unified_prompt, metrics);
     input_ids_timer.end();
+    std::cout << "Shape of input_ids: ";
+    for (const auto& dim : input_ids.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
     static ManualTimer embedding_timer("text embedding inference");
     embedding_timer.start();
     ov::Tensor text_embeds = m_embedding->infer(input_ids);
