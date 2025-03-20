@@ -288,12 +288,16 @@ InputsEmbedderQwen2VL::InputsEmbedderQwen2VL(
 }
 
 ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, const std::vector<ov::genai::EncodedImage>& images, ov::genai::VLMPerfMetrics& metrics) {
+    static ManualTimer unify_prompt_timer("unify prompt");
+    unify_prompt_timer.start();
     auto [unified_prompt, images_sequence] = unify_prompt(prompt, NATIVE_TAG, NATIVE_TAG, images.size(), m_image_id);
+    unify_prompt_timer.end();
     std::vector<ov::Tensor> image_embeds;
     std::vector<std::array<size_t, 3>> images_grid_thw;
     image_embeds.reserve(images.size());
     images_grid_thw.reserve(images.size());
-    
+    static ManualTimer image_embedding_timer("image embedding processing");
+    image_embedding_timer.start();
     for (const auto& encoded_image : images) {
         ov::Tensor single_image_embeds = encoded_image.resized_source;
         image_embeds.push_back(std::move(single_image_embeds));
@@ -303,9 +307,13 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, c
         size_t grid_w = encoded_image.resized_source_size.width;
         images_grid_thw.push_back({grid_t, grid_h, grid_w});
     }
+    image_embedding_timer.end();
 
     std::vector<ov::Tensor> reordered_image_embeds;
     std::vector<std::array<size_t, 3>> reordered_images_grid_thw;
+    
+    static ManualTimer reorder_timer("reorder image embeddings");
+    reorder_timer.start();
     for (size_t new_image_id : images_sequence) {
         auto [grid_t, grid_h, grid_w] = images_grid_thw.at(new_image_id - m_image_id);
         size_t merge_length = std::pow(m_vision_encoder->get_processor_config().merge_size, 2);
@@ -321,26 +329,37 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, c
         reordered_images_grid_thw.push_back(images_grid_thw.at(new_image_id - m_image_id));
     }
     m_image_id = images_sequence.empty() ? m_image_id : *std::max_element(images_sequence.begin(), images_sequence.end()) + 1;
+    reorder_timer.end();
 
+    static ManualTimer input_ids_timer("input ids encoding");
+    input_ids_timer.start();
     ov::Tensor input_ids = get_encoded_input_ids(unified_prompt, metrics);
+    input_ids_timer.end();
     static ManualTimer embedding_timer("text embedding inference");
     embedding_timer.start();
     ov::Tensor text_embeds = m_embedding->infer(input_ids);
     embedding_timer.end();
-
+    static ManualTimer tokenizer_timer("tokenizer encoding");
+    tokenizer_timer.start();
     auto start_tokenizer_time = std::chrono::steady_clock::now();
     ov::Tensor encoded_vision_start_token = m_tokenizer.encode(m_vlm_config.vision_start_token, ov::genai::add_special_tokens(false)).input_ids;
     ov::Tensor encoded_image_pad_token = m_tokenizer.encode(m_vlm_config.image_pad_token, ov::genai::add_special_tokens(false)).input_ids;
     auto end_tokenizer_time = std::chrono::steady_clock::now();
+    tokenizer_timer.end();
     OPENVINO_ASSERT(metrics.raw_metrics.tokenization_durations.size() > 0);
     metrics.raw_metrics.tokenization_durations[metrics.raw_metrics.tokenization_durations.size() - 1] += ov::genai::MicroSeconds(PerfMetrics::get_microsec(end_tokenizer_time - start_tokenizer_time));
     int64_t vision_start_token_id = encoded_vision_start_token.data<int64_t>()[encoded_vision_start_token.get_size() - 1];
     int64_t image_pad_token_id = encoded_image_pad_token.data<int64_t>()[encoded_image_pad_token.get_size() - 1];
 
+    static ManualTimer position_ids_timer("create position ids");
+    position_ids_timer.start();
     m_position_ids = create_position_ids(input_ids, images_grid_thw, vision_start_token_id);
-
+    position_ids_timer.end();
+    
+    static ManualTimer position_ids_max_element_timer("position ids max element calculation");
+    position_ids_max_element_timer.start();
     int64_t position_ids_max_element = *std::max_element(m_position_ids.data<int64_t>(), m_position_ids.data<int64_t>() + m_position_ids.get_size());
-    m_rope_delta = position_ids_max_element + 1 - static_cast<int64_t>(input_ids.get_shape().at(1));
+    position_ids_max_element_timer.end();
 
     if (!m_is_chat_conversation) {
         m_image_id = 0;
@@ -349,7 +368,11 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, c
         return text_embeds;
     }
 
-    return merge_text_and_image_embeddings_qwen2vl(input_ids, text_embeds, reordered_image_embeds, reordered_images_grid_thw, image_pad_token_id);
+    static ManualTimer merge_timer("merge text and image embeddings");
+    merge_timer.start();
+    auto retTensor = merge_text_and_image_embeddings_qwen2vl(input_ids, text_embeds, reordered_image_embeds, reordered_images_grid_thw, image_pad_token_id);
+    merge_timer.end();
+    return retTensor;
 }
 
 std::pair<ov::Tensor, std::optional<int64_t>> InputsEmbedderQwen2VL::get_position_ids(const size_t inputs_embeds_size, const size_t history_size) {
