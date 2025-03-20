@@ -216,9 +216,15 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(uint64_t re
     OPENVINO_ASSERT(m_model_input_type == ModelInputType::EMBEDDINGS, "Model doesn't support embeddings.");
     ov::genai::VLMPerfMetrics metrics;
     m_inputs_embedder->set_apply_chat_template_status(sampling_params.apply_chat_template);
+    std::cout << "Computing embeddings for request_id: " << request_id << std::endl;
     timer.start();
     ov::Tensor inputs = m_inputs_embedder->get_inputs_embeds(prompt, rgbs, metrics);
     timer.end();
+    std::cout << "Finished computing embeddings for request_id: " << request_id <<". Shape of inputs tensor: ";
+    for (const auto& dim : inputs.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
     return add_request(request_id, inputs, sampling_params);
 }
 
