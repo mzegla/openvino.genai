@@ -237,7 +237,8 @@ EncodedImage VisionEncoderQwen2VL::encode(const ov::Tensor& image, const ov::Any
     encoder.set_tensor("hidden_states", flattened_patches);
     static ManualTimer vision_encoder_timer("vision encoder inference");
     vision_encoder_timer.start();
-    encoder.infer();
+    encoder.start_async();
+    encoder.wait();
     vision_encoder_timer.end();
 
     const ov::Tensor& infer_output = encoder.get_output_tensor();
@@ -445,7 +446,8 @@ ov::Tensor InputsEmbedderQwen2VL::merge_text_and_image_embeddings_qwen2vl(
     vision_embeddings_merger.set_tensor("rotary_pos_emb", rotary_pos_emb);
     static ManualTimer vision_embeddings_merger_timer("vision embeddings merger inference");
     vision_embeddings_merger_timer.start();
-    vision_embeddings_merger.infer();
+    vision_embeddings_merger.start_async();
+    vision_embeddings_merger.wait();
     vision_embeddings_merger_timer.end();
     ov::Tensor processed_vision_embeds = vision_embeddings_merger.get_output_tensor();
 
