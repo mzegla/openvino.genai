@@ -320,10 +320,18 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, c
     reorder_timer.start();
     for (size_t new_image_id : images_sequence) {
         auto [grid_t, grid_h, grid_w] = images_grid_thw.at(new_image_id - m_image_id);
+        std::cout << "grid_t: " << grid_t << ", grid_h: " << grid_h << ", grid_w: " << grid_w << std::endl;
+
         size_t merge_length = std::pow(m_vision_encoder->get_processor_config().merge_size, 2);
+        std::cout << "merge_length: " << merge_length << std::endl;
+
         size_t num_image_pad_tokens = grid_t * grid_h * grid_w / merge_length;
+        std::cout << "num_image_pad_tokens: " << num_image_pad_tokens << std::endl;
 
         std::string expanded_tag = m_vlm_config.vision_start_token;
+        std::cout << "expanded_tag: " << expanded_tag << std::endl;
+
+
         for (int i = 0; i < num_image_pad_tokens; i++) {
             expanded_tag += m_vlm_config.image_pad_token;
         }
