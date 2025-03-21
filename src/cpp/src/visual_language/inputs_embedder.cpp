@@ -303,6 +303,7 @@ std::pair<std::string, std::vector<size_t>> unify_prompt(
     size_t n_new_images,
     size_t first_new_image_id
 ) {
+    std::cout << "Number of new images: " << n_new_images << std::endl;
     bool found_universal_tag = std::regex_search(prompt, UNIVERSAL_PATTERN);
     bool found_native_tag = prompt.find(native_tag) != std::string::npos;
     OPENVINO_ASSERT(!(found_universal_tag && found_native_tag), "Prompt can contain only one type of image tags.");
