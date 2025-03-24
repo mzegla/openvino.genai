@@ -258,6 +258,10 @@ ov::Tensor InputsEmbedderInternVLChat::get_inputs_embeds(const std::string& prom
     ov::Tensor text_embeds = m_embedding->infer(req, input_ids);
 
     if (images.empty()) {
+        // We need to make a copy before leaving the scope because text_embeds is bound to infer request that
+        // will be returned to the pool after leaving this scope
+        ov::Tensor inputs_embeds(text_embeds.get_element_type(), text_embeds.get_shape());
+        std::memcpy(inputs_embeds.data(), text_embeds.data(), text_embeds.get_byte_size());
         return text_embeds;
     }
     auto start_tokenizer_time = std::chrono::steady_clock::now();
@@ -266,6 +270,8 @@ ov::Tensor InputsEmbedderInternVLChat::get_inputs_embeds(const std::string& prom
     OPENVINO_ASSERT(metrics.raw_metrics.tokenization_durations.size() > 0);
     metrics.raw_metrics.tokenization_durations[metrics.raw_metrics.tokenization_durations.size() - 1] += ov::genai::MicroSeconds(PerfMetrics::get_microsec(end_tokenizer_time - start_tokenizer_time));
     int64_t image_context_token_id = encoded_image_context_token.data<int64_t>()[encoded_image_context_token.get_size() - 1];
+
+    // Below method returns independent tensor, so it's safe to leave this scope and return infer requests to  the queue
     return merge_text_and_image_embeddings_internvl(input_ids, text_embeds, image_embeds, image_context_token_id);
 }
 

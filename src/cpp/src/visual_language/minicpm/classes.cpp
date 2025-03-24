@@ -649,9 +649,11 @@ ov::Tensor InputsEmbedderMiniCPM::get_inputs_embeds(const std::string& prompt, c
     size_t encoded_input_size = encoded_input.get_size();
     int64_t* end = ids + encoded_input_size;
     float* inputs_embeds_data = inputs_embeds.data<float>();
+    CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(this->m_ireq_queue_resampler.get());
+    ov::InferRequest& resampler = infer_request_guard.get();
     for (size_t image_id : images_sequence) {
         const EncodedImage& encoded_image = images.at(image_id - m_prev_image_id);
-        const ov::Tensor& resampled_source = resample(encoded_image.resized_source, {encoded_image.resized_source_size});
+        const ov::Tensor& resampled_source = resample(resampler, encoded_image.resized_source, {encoded_image.resized_source_size});
         float* emb = resampled_source.data<float>();
         ids = std::find(ids, end, im_start_id);
         OPENVINO_ASSERT(end != ids);
@@ -666,7 +668,7 @@ ov::Tensor InputsEmbedderMiniCPM::get_inputs_embeds(const std::string& prompt, c
                     size_t d2 = slices_shape.at(2);
                     size_t d3 = slices_shape.at(3);
                     ov::Tensor encoded_view{ov::element::f32, {1, d2, d3}, encoded_image.slices.data<float>() + (i * slices_shape.at(1) + ja) * d2 * d3};
-                    const ov::Tensor& vision_embed_tensor_i_j = resample(encoded_view, {encoded_image.slices_size});
+                    const ov::Tensor& vision_embed_tensor_i_j = resample(resampler, encoded_view, {encoded_image.slices_size});
                     ids = std::find(ids, end, slice_start_id);
                     OPENVINO_ASSERT(end != ids);
                     ++ids;
@@ -706,7 +708,7 @@ bool InputsEmbedderMiniCPM::prompt_has_image_tag(const std::string& prompt) cons
     return IInputsEmbedder::prompt_has_image_tag(prompt) || prompt.find(NATIVE_TAG) != std::string::npos;
 }
 
-ov::Tensor InputsEmbedderMiniCPM::resample(const ov::Tensor& encoded_image, const std::vector<ImageSize>& target_sizes) {
+ov::Tensor InputsEmbedderMiniCPM::resample(ov::InferRequest& resampler, const ov::Tensor& encoded_image, const std::vector<ImageSize>& target_sizes) {
     size_t bs = encoded_image.get_shape().at(0);
     std::vector<size_t> patch_len{target_sizes.size()};
     std::transform(target_sizes.begin(), target_sizes.end(), patch_len.begin(), [](const ImageSize& height_width) {
@@ -744,8 +746,6 @@ ov::Tensor InputsEmbedderMiniCPM::resample(const ov::Tensor& encoded_image, cons
         std::fill_n(mask_data + i * max_patch_len, patch_len[i], 0.0f);
         std::fill_n(mask_data + i * max_patch_len + patch_len[i], max_patch_len - patch_len[i], 1.0f);
     }
-    CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(this->m_ireq_queue_resampler.get());
-    ov::InferRequest& resampler = infer_request_guard.get();
     resampler.set_tensor("image_feature", encoded_image);  // [N, H*W, old_hidden_size]
     resampler.set_tensor("pos_embed", pos_embed);  // [H*W, N, new_hidden_size]
     resampler.set_tensor("key_padding_mask", key_padding_mask);  // [N, H*W]

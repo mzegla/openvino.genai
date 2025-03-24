@@ -56,7 +56,7 @@ public:
     bool prompt_has_image_tag(const std::string& prompt) const override;
 
 private:
-    ov::Tensor resample(const ov::Tensor& encoded_image, const std::vector<ImageSize>& target_sizes);
+    ov::Tensor resample(ov::InferRequest& resampler, const ov::Tensor& encoded_image, const std::vector<ImageSize>& target_sizes);
 };
 
 } // namespace ov::genai

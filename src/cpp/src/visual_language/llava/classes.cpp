@@ -189,7 +189,12 @@ ov::Tensor InputsEmbedderLLaVA::merge_text_and_image_embeddings_llava(
         );
         token_offset -= n_tokens + 1;
     }
-    return text_embeds;
+
+    // We need to make a copy before leaving the scope because text_embeds is bound to infer request that
+    // will be returned to the pool after leaving this scope
+    ov::Tensor inputs_embeds(text_embeds.get_element_type(), text_embeds.get_shape());
+    std::memcpy(inputs_embeds.data(), text_embeds.data(), text_embeds.get_byte_size());
+    return inputs_embeds;
 }
 
 } // namespace ov::genai

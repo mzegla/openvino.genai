@@ -348,7 +348,7 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, c
         return text_embeds;
     }
 
-    // Below method returs independent tensor, so it's safe to leave this scope and return infer requests to  the queue
+    // Below method returns independent tensor, so it's safe to leave this scope and return infer requests to  the queue
     return merge_text_and_image_embeddings_qwen2vl(input_ids, text_embeds, reordered_image_embeds, reordered_images_grid_thw, image_pad_token_id);
 }
 
