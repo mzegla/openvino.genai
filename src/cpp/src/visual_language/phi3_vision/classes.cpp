@@ -590,8 +590,10 @@ ov::Tensor InputsEmbedderPhi3V::get_inputs_embeds(const std::string& prompt, con
     OPENVINO_ASSERT(features_length == new_tokens.get_shape().at(1));
     ov::Tensor inputs_embeds{ov::element::f32, {1, features_length, m_vlm_config.hidden_size}};
     size_t offset = 0;
+    CircularBufferQueueElementGuard<EmbeddingsRequest> embeddings_request_guard(m_embedding->get_request_queue().get());
+    EmbeddingsRequest& req = embeddings_request_guard.get();
     if (tokens.size() > images_features_proj.size()) {
-        const ov::Tensor& text_embeds = m_embedding->infer(tokens.at(0));
+        const ov::Tensor& text_embeds = m_embedding->infer(req, tokens.at(0));
         size_t text_length = text_embeds.get_shape().at(1);
         std::copy_n(
             text_embeds.data<float>(),
@@ -601,6 +603,7 @@ ov::Tensor InputsEmbedderPhi3V::get_inputs_embeds(const std::string& prompt, con
         offset = text_length;
         tokens.erase(tokens.begin());
     }
+
     for (size_t im_id = 0; im_id < images_features_proj.size(); ++im_id) {
         const ov::Tensor& image_embeds = images_features_proj.at(im_id);
         size_t im_length = image_embeds.get_shape().at(1);
@@ -610,7 +613,7 @@ ov::Tensor InputsEmbedderPhi3V::get_inputs_embeds(const std::string& prompt, con
             inputs_embeds.data<float>() + offset * m_vlm_config.hidden_size
         );
         offset += im_length;
-        const ov::Tensor& text_embeds = m_embedding->infer(tokens.at(im_id));
+        const ov::Tensor& text_embeds = m_embedding->infer(req, tokens.at(im_id));
         size_t text_length = text_embeds.get_shape().at(1);
         std::copy_n(
             text_embeds.data<float>(),
