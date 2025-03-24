@@ -80,7 +80,9 @@ ov::Tensor EmbeddingsModel::infer(const ov::Tensor& input_idx, bool return_remot
     }
     req.ireq.start_async();
     req.ireq.wait();
-    return req.ireq.get_output_tensor();
+    ov::Tensor text_embeds(req.ireq.get_output_tensor().get_element_type(), req.ireq.get_output_tensor().get_shape());
+    std::memcpy(text_embeds.data(), req.ireq.get_output_tensor().data(), req.ireq.get_output_tensor().get_byte_size());
+    return text_embeds;
 }
 
 void EmbeddingsModel::merge_postprocess(std::shared_ptr<ov::Model> model, float scale_emb) const {
