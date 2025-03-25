@@ -283,7 +283,21 @@ InputsEmbedderQwen2VL::InputsEmbedderQwen2VL(
 }
 
 ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, const std::vector<ov::genai::EncodedImage>& images, ov::genai::VLMPerfMetrics& metrics) {
-    auto [unified_prompt, images_sequence] = unify_prompt(prompt, NATIVE_TAG, NATIVE_TAG, images.size(), m_image_id);
+    size_t image_id;
+    ov::Tensor position_ids;
+    int64_t rope_delta;
+    if (m_is_chat_conversation) {
+        // Use global embedder internal state - not suitable for multi-threaded execution
+        image_id = m_image_id;
+        position_ids = m_position_ids;
+        rope_delta = m_rope_delta;
+    } else {
+        // Use local state - suitable for multi-threaded execution
+        image_id = 0;
+        rope_delta = 0;
+    }
+
+    auto [unified_prompt, images_sequence] = unify_prompt(prompt, NATIVE_TAG, NATIVE_TAG, images.size(), image_id);
     std::vector<ov::Tensor> image_embeds;
     std::vector<std::array<size_t, 3>> images_grid_thw;
     image_embeds.reserve(images.size());
@@ -302,7 +316,7 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, c
     std::vector<ov::Tensor> reordered_image_embeds;
     std::vector<std::array<size_t, 3>> reordered_images_grid_thw;
     for (size_t new_image_id : images_sequence) {
-        auto [grid_t, grid_h, grid_w] = images_grid_thw.at(new_image_id - m_image_id);
+        auto [grid_t, grid_h, grid_w] = images_grid_thw.at(new_image_id - image_id);
         size_t merge_length = std::pow(m_vision_encoder->get_processor_config().merge_size, 2);
         size_t num_image_pad_tokens = grid_t * grid_h * grid_w / merge_length;
 
@@ -312,10 +326,10 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, c
         }
         expanded_tag += m_vlm_config.vision_end_token;
         unified_prompt.replace(unified_prompt.find(NATIVE_TAG), NATIVE_TAG.length(), expanded_tag);
-        reordered_image_embeds.push_back(image_embeds.at(new_image_id - m_image_id));
-        reordered_images_grid_thw.push_back(images_grid_thw.at(new_image_id - m_image_id));
+        reordered_image_embeds.push_back(image_embeds.at(new_image_id - image_id));
+        reordered_images_grid_thw.push_back(images_grid_thw.at(new_image_id - image_id));
     }
-    m_image_id = images_sequence.empty() ? m_image_id : *std::max_element(images_sequence.begin(), images_sequence.end()) + 1;
+    image_id = images_sequence.empty() ? image_id : *std::max_element(images_sequence.begin(), images_sequence.end()) + 1;
 
     ov::Tensor input_ids = get_encoded_input_ids(unified_prompt, metrics);
 
@@ -332,24 +346,30 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, c
     int64_t vision_start_token_id = encoded_vision_start_token.data<int64_t>()[encoded_vision_start_token.get_size() - 1];
     int64_t image_pad_token_id = encoded_image_pad_token.data<int64_t>()[encoded_image_pad_token.get_size() - 1];
 
-    m_position_ids = create_position_ids(input_ids, images_grid_thw, vision_start_token_id);
+    position_ids = create_position_ids(input_ids, images_grid_thw, vision_start_token_id);
 
-    int64_t position_ids_max_element = *std::max_element(m_position_ids.data<int64_t>(), m_position_ids.data<int64_t>() + m_position_ids.get_size());
-    m_rope_delta = position_ids_max_element + 1 - static_cast<int64_t>(input_ids.get_shape().at(1));
+    int64_t position_ids_max_element = *std::max_element(position_ids.data<int64_t>(), position_ids.data<int64_t>() + position_ids.get_size());
+    rope_delta = position_ids_max_element + 1 - static_cast<int64_t>(input_ids.get_shape().at(1));
 
-    if (!m_is_chat_conversation) {
-        m_image_id = 0;
-    }
     if (images.empty()) {
         // We need to make a copy before leaving the scope because text_embeds is bound to infer request that
         // will be returned to the pool after leaving this scope
         ov::Tensor inputs_embeds(text_embeds.get_element_type(), text_embeds.get_shape());
         std::memcpy(inputs_embeds.data(), text_embeds.data(), text_embeds.get_byte_size());
-        return text_embeds;
+        return inputs_embeds;
     }
 
     // Below method returns independent tensor, so it's safe to leave this scope and return infer requests to  the queue
-    return merge_text_and_image_embeddings_qwen2vl(input_ids, text_embeds, reordered_image_embeds, reordered_images_grid_thw, image_pad_token_id);
+    ov::Tensor merged_embedds = merge_text_and_image_embeddings_qwen2vl(input_ids, text_embeds, reordered_image_embeds, reordered_images_grid_thw, image_pad_token_id);
+
+    if(m_is_chat_conversation) {
+        // Save state for next chat turn
+        m_image_id = image_id;
+        m_position_ids = position_ids;
+        m_rope_delta = rope_delta;
+    }
+
+    return merged_embedds;
 }
 
 std::pair<ov::Tensor, std::optional<int64_t>> InputsEmbedderQwen2VL::get_position_ids(const size_t inputs_embeds_size, const size_t history_size) {
@@ -363,6 +383,20 @@ std::pair<ov::Tensor, std::optional<int64_t>> InputsEmbedderQwen2VL::get_positio
         return {position_ids, m_rope_delta};
     }
     return {m_position_ids, m_rope_delta};
+}
+
+std::pair<ov::Tensor, std::optional<int64_t>> InputsEmbedderQwen2VL::get_position_ids(const ov::Tensor& current_position_ids, const int64_t rope_delta,
+    const size_t inputs_embeds_size, const size_t history_size) {
+    if (history_size != 0) {
+        ov::Tensor position_ids{ov::element::i64, {3, 1, inputs_embeds_size}};
+        int64_t new_pos_id = static_cast<int64_t>(history_size + rope_delta);
+        for (size_t dim = 0; dim < 3; ++dim) {
+            int64_t* pos_data = position_ids.data<int64_t>() + dim * inputs_embeds_size;
+            std::iota(pos_data, pos_data + inputs_embeds_size, new_pos_id);
+        }
+        return {position_ids, rope_delta};
+    }
+    return {current_position_ids, rope_delta};
 }
 
 void InputsEmbedderQwen2VL::start_chat(const std::string& system_message) {

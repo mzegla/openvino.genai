@@ -55,7 +55,6 @@ protected:
     // to access m_load_time_ms
     friend class ContinuousBatchingPipeline;
 
-    std::mutex m_mutex;
     ModelInputType m_model_input_type = ModelInputType::TOKENS;
     std::shared_ptr<InputsEmbedder> m_inputs_embedder;
 
