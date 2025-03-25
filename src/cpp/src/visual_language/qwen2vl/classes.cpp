@@ -467,10 +467,9 @@ ov::Tensor InputsEmbedderQwen2VL::merge_text_and_image_embeddings_qwen2vl(
         }
     }
 
-    ov::Tensor rotary_pos_emb = get_rotary_pos_emb(images_grid_thw);
-
     CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(this->m_ireq_queue_vision_embeddings_merger.get());
     ov::InferRequest& vision_embeddings_merger = infer_request_guard.get();
+    ov::Tensor rotary_pos_emb = get_rotary_pos_emb(vision_embeddings_merger, images_grid_thw);
     vision_embeddings_merger.set_tensor("hidden_states", concatenated_images);
     vision_embeddings_merger.set_tensor("attention_mask", attention_mask);
     vision_embeddings_merger.set_tensor("rotary_pos_emb", rotary_pos_emb);
@@ -512,7 +511,7 @@ ov::Tensor InputsEmbedderQwen2VL::merge_text_and_image_embeddings_qwen2vl(
     return merged_embeds;
 }
 
-ov::Tensor InputsEmbedderQwen2VL::get_rotary_pos_emb(const std::vector<std::array<size_t, 3>>& grids_thw) {  
+ov::Tensor InputsEmbedderQwen2VL::get_rotary_pos_emb(ov::InferRequest& vision_embeddings_merger, const std::vector<std::array<size_t, 3>>& grids_thw) {  
     const size_t spatial_merge_size = m_vision_encoder->get_processor_config().merge_size;
 
     std::vector<std::vector<size_t>> all_pos_ids;
@@ -584,8 +583,6 @@ ov::Tensor InputsEmbedderQwen2VL::get_rotary_pos_emb(const std::vector<std::arra
     }
 
     // Calculate rotary embeddings for max_grid_size
-    CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(this->m_ireq_queue_vision_embeddings_merger.get());
-    ov::InferRequest& vision_embeddings_merger = infer_request_guard.get();
     const size_t dim = vision_embeddings_merger.get_tensor("rotary_pos_emb").get_shape().at(1);
     const float theta = 10000.0f;
     

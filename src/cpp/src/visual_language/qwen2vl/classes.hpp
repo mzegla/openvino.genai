@@ -68,7 +68,7 @@ protected:
         const int64_t image_pad_token_id
     );
 
-    ov::Tensor get_rotary_pos_emb(const std::vector<std::array<size_t, 3>>& grids_thw);
+    ov::Tensor get_rotary_pos_emb(ov::InferRequest& vision_embeddings_merger, const std::vector<std::array<size_t, 3>>& grids_thw);
 
     ov::Tensor create_position_ids(
         const ov::Tensor& input_ids_tensor,
