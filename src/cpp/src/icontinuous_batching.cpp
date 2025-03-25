@@ -216,6 +216,11 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(uint64_t re
     ov::genai::VLMPerfMetrics metrics;
     m_inputs_embedder->set_apply_chat_template_status(sampling_params.apply_chat_template);
     ov::Tensor inputs = m_inputs_embedder->get_inputs_embeds(prompt, rgbs, metrics);
+    std::cout << "Pipeline input tensor shape: ";
+    for (const auto& dim : inputs.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
     return add_request(request_id, inputs, sampling_params);
 }
 
