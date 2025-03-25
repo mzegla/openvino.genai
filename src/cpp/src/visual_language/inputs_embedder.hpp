@@ -89,6 +89,7 @@ private:
         ov::genai::GenerationStatus m_chat_generation_finish_status = ov::genai::GenerationStatus::RUNNING;
         // reflection of tokens contained in the kv cache
         utils::KVCacheState m_kv_cache_state;
+        std::mutex m_kv_cache_mutex;
         // length of attention_mask/kv cache at the beginning of generation()
         size_t m_prev_hist_length = 0;
         // Verifies no previous image is referenced.

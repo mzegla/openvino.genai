@@ -156,8 +156,11 @@ ov::Tensor InputsEmbedder::IInputsEmbedder::update_history(const ov::Tensor& new
 ov::Tensor InputsEmbedder::IInputsEmbedder::get_encoded_input_ids(const std::string& prompt, ov::genai::VLMPerfMetrics& metrics) {
     const auto new_chat_tokens = apply_chat_template_tokenize(prompt, metrics);
     auto new_input_ids = update_history(new_chat_tokens);
-    m_prev_hist_length = m_kv_cache_state.get_state().size();
-    m_kv_cache_state.add_inputs(new_input_ids);
+    {
+        std::lock_guard<std::mutex> lock(m_kv_cache_mutex);
+        m_prev_hist_length = m_kv_cache_state.get_state().size();
+        m_kv_cache_state.add_inputs(new_input_ids);
+    }
 
     return new_input_ids;
 }

@@ -283,18 +283,14 @@ InputsEmbedderQwen2VL::InputsEmbedderQwen2VL(
 }
 
 ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& prompt, const std::vector<ov::genai::EncodedImage>& images, ov::genai::VLMPerfMetrics& metrics) {
-    size_t image_id;
+    size_t image_id = 0;
     ov::Tensor position_ids;
-    int64_t rope_delta;
+    int64_t rope_delta = 0;
     if (m_is_chat_conversation) {
         // Use global embedder internal state - not suitable for multi-threaded execution
         image_id = m_image_id;
         position_ids = m_position_ids;
         rope_delta = m_rope_delta;
-    } else {
-        // Use local state - suitable for multi-threaded execution
-        image_id = 0;
-        rope_delta = 0;
     }
 
     auto [unified_prompt, images_sequence] = unify_prompt(prompt, NATIVE_TAG, NATIVE_TAG, images.size(), image_id);
