@@ -360,7 +360,11 @@ public:
                     ov::Coordinate start{0, embeds_pos, 0};
                     ov::Coordinate end{1, embeds_pos + new_embeds_count, hidden_size};
                     ov::Tensor embedding(generated_ids_embeds, start, end);
-                    seq->append_generated_ids_embeds(embedding);
+
+                    ov::Tensor embedding_copy(embedding.get_element_type(), embedding.get_shape());
+                    std::memcpy(embedding_copy.data(), embedding.data(), embedding.get_byte_size());
+
+                    seq->append_generated_ids_embeds(embedding_copy);
                     embeds_pos += new_embeds_count;
                 }
             }
