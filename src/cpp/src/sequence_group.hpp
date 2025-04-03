@@ -718,8 +718,10 @@ public:
 
     void notify_handle() {
         if (out_of_memory()) {
+            std::cout << "Request id " << m_request_id << " out of memory" << std::endl;
             set_generation_status(GenerationStatus::IGNORED);
         } else if (has_finished()) {
+            std::cout << "Request id " << m_request_id << " finished" << std::endl;
             set_generation_status(GenerationStatus::FINISHED);
         }
         // For beam search streaming is not available, so we notify only upon finishing

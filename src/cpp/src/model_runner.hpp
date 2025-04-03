@@ -315,6 +315,8 @@ public:
         size_t num_generated_ids_without_embeddings = 0;
         OPENVINO_ASSERT(sequence_groups.size() > 0);
 
+        std::cout << "=======================================================" << std::endl;
+
         // compute aggregated values
         for (size_t i = 0; i < num_sequence_groups; ++i) {
             size_t seq_group_id = scheduler_output.m_scheduled_sequence_groups_ids[i];
@@ -323,8 +325,16 @@ public:
             OPENVINO_ASSERT(sequence_group->get_sequence_group_type() == SequenceGroupType::EMBEDDINGS);
             for (auto seq: sequence_group->get_running_sequences()) {
                 num_generated_ids_without_embeddings += seq->get_generated_len() - seq->get_generated_ids_embeds().size();
+                int64_t generated_id = -1;
+                if (seq->get_generated_len() > 0) {
+                    generated_id = seq->get_generated_ids().back();
+                }
+                std::cout << "For request id " << sequence_group->get_request_id() << ", prompt len: "<< sequence_group->get_prompt_len() 
+                << "; generated ids embeds: " << seq->get_generated_ids_embeds().size()
+                << "; last generated id: " << generated_id << std::endl;
             }
         }
+        std::cout << "=======================================================" << std::endl;
         size_t hidden_size = sequence_groups[0]->get_hidden_size();
 
         ov::Tensor generated_ids_embeds;
@@ -360,11 +370,7 @@ public:
                     ov::Coordinate start{0, embeds_pos, 0};
                     ov::Coordinate end{1, embeds_pos + new_embeds_count, hidden_size};
                     ov::Tensor embedding(generated_ids_embeds, start, end);
-
-                    ov::Tensor embedding_copy(embedding.get_element_type(), embedding.get_shape());
-                    std::memcpy(embedding_copy.data(), embedding.data(), embedding.get_byte_size());
-
-                    seq->append_generated_ids_embeds(embedding_copy);
+                    seq->append_generated_ids_embeds(embedding);
                     embeds_pos += new_embeds_count;
                 }
             }
