@@ -215,7 +215,11 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(uint64_t re
     OPENVINO_ASSERT(m_model_input_type == ModelInputType::EMBEDDINGS, "Model doesn't support embeddings.");
     ov::genai::VLMPerfMetrics metrics;
     m_inputs_embedder->set_apply_chat_template_status(sampling_params.apply_chat_template);
-    ov::Tensor inputs = m_inputs_embedder->get_inputs_embeds(prompt, rgbs, metrics);
+    ov::Tensor inputs;
+    {
+        std::lock_guard<std::mutex> lock(m_inputs_embedder_mutex);
+        inputs = m_inputs_embedder->get_inputs_embeds(prompt, rgbs, metrics);
+    }
     std::cout << "Pipeline input tensor shape: ";
     for (const auto& dim : inputs.get_shape()) {
         std::cout << dim << " ";
