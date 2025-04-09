@@ -476,8 +476,6 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_free_non_running_reque
             for (const auto& sequence: request->get_sequences()) {
                 if (sequence->get_generated_ids_embeds().size() == 0) {
                     std::cout << "Warning: sequence for request with id " << request->get_request_id() << " has finished, but generated no embeds" << std::endl;
-                } else {
-                    std::cout << "Last generated token id: " << sequence->get_generated_ids().back() << std::endl;
                 }
                 if (m_scheduler->has_block_table(sequence->get_id())) {
                     m_scheduler->free_sequence(sequence->get_id());
