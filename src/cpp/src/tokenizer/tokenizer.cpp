@@ -567,9 +567,11 @@ public:
         env.GetSettings().trimBlocks = true;
         jinja2::Template tpl(&env);
         tpl.Load(chat_tpl);
+        std::cout << "Chat template in apply_chat_template call: " << chat_tpl << std::endl;
 
         jinja2::UserCallable slice_callable = jinja2::MakeCallable(
             [](const jinja2::GenericList& messages, const size_t& start) {
+                std::cout << "Slice called inside Jinja processing call" << std::endl;
                 jinja2::ValuesList result;
 
                 size_t iter_num = 0;
@@ -589,6 +591,7 @@ public:
         for (const auto& message : history) {
             jinja_message = {{"role", message.at("role")}, {"content", message.at("content")}};
             jinja_messages.emplace_back(jinja_message);
+            std::cout << "Added message with role [" << message.at("role") << "]: " << message.at("content") << std::endl;
         }
 
         jinja2::ValuesMap params = {
