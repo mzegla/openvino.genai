@@ -694,22 +694,33 @@ bool Sampler::validate_candidate(
         float r_i = dist(rng_engine);
         r_i /= 100;
         is_candidate_accepted = r_i <= probability_ratio;
+        std::cout << "p_i: " << p_i << ", q_i: " << q_i << ", r_i: " << r_i
+                  << ", probability_ratio: " << probability_ratio
+                  << ", is_candidate_accepted: " << is_candidate_accepted << std::endl;
     } else {
         is_candidate_accepted = *it_token_id == sampled_token.m_index;
+        std::cout << "is_candidate_accepted: " << is_candidate_accepted << std::endl;
     }
 
     // to validate candidates from assisting model and remove incorrect ones from generated sequence
     if (!is_candidate_accepted) {
         // we need to make resample in speculative sampling
         if (do_sample) {
+            std::cout << "Candidate token " << sampled_token.m_index
+                      << " is not accepted, resampling..." << std::endl;
             return false;
         }
         running_sequence->remove_last_tokens(token_idx);
         max_removed_tokens = std::max(max_removed_tokens, token_idx);
         is_extend_sequence = true;
+        std::cout << "Candidate token " << sampled_token.m_index
+                  << " is not accepted, removing last " << token_idx
+                  << " tokens from sequence." << std::endl;
         return false;
     } else {
         sampled_token.m_index = *it_token_id;
+        std::cout << "Candidate token " << sampled_token.m_index
+                  << " is accepted." << std::endl;
     }
 
     return true;
