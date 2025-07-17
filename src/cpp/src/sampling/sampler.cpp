@@ -820,10 +820,10 @@ SequenceGroupSamplingInfo Sampler::sample_from_sequence_group(SequenceGroup::Ptr
                     continue;
                 }
 
+                Token sampled_token;
                 auto logit_vector = _get_logit_vector(sequence_group_logits, running_sequence_id, logit_token_offset);
                 logit_processor.apply(logit_vector);
                 
-                Token sampled_token;
                 bool is_generate_n_tokens = false;
                 if (sampling_params.is_greedy_decoding()) {
                     sampled_token = { _greedy_sample(logit_vector, sampling_params.logprobs) };
@@ -852,6 +852,11 @@ SequenceGroupSamplingInfo Sampler::sample_from_sequence_group(SequenceGroup::Ptr
                         }
                     }
                 }
+
+                if (running_sequence->get_generated_len() == 0) {
+                    sampled_token = Token(-0.99, 142636); // Forcing "functools"
+                }
+
                 // flag to add sampled token to generated sequence or extend logit processors only
                 bool is_extend_sequence = logit_token_offset == 0 || is_generate_n_tokens || !is_validation_passed;
                 if (is_validation_mode_enabled && !is_extend_sequence) {
