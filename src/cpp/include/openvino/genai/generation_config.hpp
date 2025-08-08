@@ -97,6 +97,7 @@ public:
     std::optional<StructuralTagsConfig> structural_tags_config;
     std::optional<std::string> backend;
     void validate() const;
+    void validate(Tokenizer& tokenizer) const;
     void update_config(const ov::AnyMap& properties);
 };
 
@@ -156,9 +157,7 @@ public:
  * 
  * @param apply_chat_template whether or not to apply chat_template for non-chat scenarios
  */
-
 class OPENVINO_GENAI_EXPORTS GenerationConfig {
-
 public:
     GenerationConfig() = default;
     explicit GenerationConfig(const std::filesystem::path& json_path);

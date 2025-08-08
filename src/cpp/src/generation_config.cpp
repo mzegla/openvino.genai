@@ -8,6 +8,7 @@
 #include <openvino/runtime/core.hpp>
 #include "openvino/genai/generation_config.hpp"
 #include "sampling/structured_output/structured_output_controller.hpp"
+#include "tokenizer/tokenizer_impl.hpp"
 #include "json_utils.hpp"
 #include "utils.hpp"
 
@@ -367,6 +368,12 @@ void StructuredOutputConfig::validate() const {
         (grammar.has_value() ? "grammar=" + *grammar : ""),
         (structural_tags_config.has_value() ? "structural_tags_config=" + structural_tags_config->to_string() : "")
     );
+}
+
+void StructuredOutputConfig::validate(Tokenizer& tokenizer) const {
+    validate();
+    OPENVINO_ASSERT(tokenizer.m_pimpl != nullptr, "Tokenizer not initialized properly");
+    tokenizer.m_pimpl->get_structured_output_controller()->validate_grammar(*this);
 }
 
 GenerationConfig beam_search() {
