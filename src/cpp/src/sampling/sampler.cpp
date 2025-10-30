@@ -853,6 +853,7 @@ SequenceGroupSamplingInfo Sampler::sample_from_sequence_group(SequenceGroup::Ptr
                         }
                     }
                 }
+                std::cout << "Sampled token: " << sampled_token.m_index << " with log prob: " << sampled_token.m_log_prob << std::endl;
                 // flag to add sampled token to generated sequence or extend logit processors only
                 bool is_extend_sequence = logit_token_offset == 0 || is_generate_n_tokens || !is_validation_passed;
                 if (is_validation_mode_enabled && !is_extend_sequence) {

@@ -206,6 +206,7 @@ public:
     void apply(Logits& logits) override {
         size_t vocab_size = logits.m_size;
         for (const auto& prompt_id : *m_unique_prompt_token_ids) {
+            std::cout << "Applying repetition penalty for prompt token id: " << prompt_id << "; vocab size: " << vocab_size << std::endl;
             OPENVINO_ASSERT((prompt_id >= 0) && (prompt_id < vocab_size), "input_ids token out of bounds");
             if (logits.m_data[prompt_id] >= 0) {
                 logits.m_data[prompt_id] /= m_penalty;
