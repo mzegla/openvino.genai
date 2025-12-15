@@ -8,6 +8,7 @@
 #include "openvino/genai/lora_adapter.hpp"
 #include "continuous_batching/cache_eviction.hpp"
 #include "visual_language/inputs_embedder.hpp"
+#include "whisper/whisper.hpp"
 
 namespace ov::genai {
 
@@ -116,16 +117,31 @@ public:
                            const ov::genai::GenerationConfig& generation_config,
                            bool is_validation_mode_enabled = false);
     
+    ContinuousBatchingImpl(const std::shared_ptr<ov::Model>& model,
+                           std::shared_ptr<SpeechEncoder> speech_encoder,
+                           const Tokenizer& tokenizer,
+                           const SchedulerConfig& scheduler_config,
+                           const std::string& device,
+                           const ov::AnyMap& properties,
+                           const ov::genai::GenerationConfig& generation_config,
+                           bool is_validation_mode_enabled = false);
+    
     virtual ~ContinuousBatchingImpl();
 
     GenerationHandle add_request(uint64_t request_id,
                                  const ov::Tensor& input_ids,
                                  const ov::genai::GenerationConfig& sampling_params,
-                                 std::optional<ov::Tensor> token_type_ids = std::nullopt) override;
+                                 std::optional<ov::Tensor> token_type_ids = std::nullopt,
+                                 std::optional<ov::Tensor> encoder_hidden_state = std::nullopt) override;
 
     GenerationHandle add_request(uint64_t request_id,
                                  const std::string& prompt,
                                  const ov::genai::GenerationConfig& sampling_params) override;
+    
+    GenerationHandle add_request(uint64_t request_id,
+                                 const ov::Tensor& input_ids,
+                                 const ov::Tensor& encoder_hidden_state,
+                                 const ov::genai::WhisperGenerationConfig& sampling_params) override;
 
     bool has_non_finished_requests() override;
 

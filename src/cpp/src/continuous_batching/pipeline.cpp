@@ -57,6 +57,12 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline( const std::filesystem::p
         embedder = std::make_shared<InputsEmbedder>(models_path, device, vision_encoder_properties);
     }
 
+    std::shared_ptr<SpeechEncoder> speech_encoder = nullptr;
+    if (std::filesystem::exists(models_path / "openvino_encoder_model.xml")) {
+        std::cout << "Creating SpeechEncoder from " << (models_path / "openvino_encoder_model.xml") << std::endl;
+        speech_encoder = std::make_shared<SpeechEncoder>(models_path, device, properties_without_draft_model);
+    }
+
     utils::print_scheduler_config_info(scheduler_config);
 
     if (is_prompt_lookup_enabled) {
@@ -69,8 +75,9 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline( const std::filesystem::p
         m_impl = std::make_shared<SpeculativeDecodingImpl>(main_model_descr, draft_model_desr);
     } else if (embedder) {
         m_impl = std::make_shared<ContinuousBatchingImpl>(model, embedder, tokenizer, scheduler_config, device, properties_without_draft_model_without_gguf, generation_config);
-    }
-    else {
+    } else if (speech_encoder) {
+        m_impl = std::make_shared<ContinuousBatchingImpl>(model, speech_encoder, tokenizer, scheduler_config, device, properties_without_draft_model_without_gguf, generation_config);
+    } else {
         m_impl = std::make_shared<ContinuousBatchingImpl>(model, tokenizer, scheduler_config, device, properties_without_draft_model_without_gguf, generation_config);
     }
 
@@ -99,6 +106,12 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline(
         embedder = std::make_shared<InputsEmbedder>(models_path, device, properties_without_draft_model_without_gguf);
     }
 
+    std::shared_ptr<SpeechEncoder> speech_encoder = nullptr;
+    if (std::filesystem::exists(models_path / "openvino_encoder_model.xml")) {
+        std::cout << "Creating SpeechEncoder from " << (models_path / "openvino_encoder_model.xml") << std::endl;
+        speech_encoder = std::make_shared<SpeechEncoder>(models_path, device, properties_without_draft_model);
+    }
+
     utils::print_scheduler_config_info(scheduler_config);
 
     if (is_prompt_lookup_enabled) {
@@ -111,6 +124,8 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline(
         m_impl = std::make_shared<SpeculativeDecodingImpl>(main_model_descr, draft_model_desr);
     } else if (embedder) {
         m_impl = std::make_shared<ContinuousBatchingImpl>(model, embedder, tokenizer, scheduler_config, device, properties_without_draft_model_without_gguf, generation_config);
+    } else if (speech_encoder) {
+        m_impl = std::make_shared<ContinuousBatchingImpl>(model, speech_encoder, tokenizer, scheduler_config, device, properties_without_draft_model_without_gguf, generation_config);
     } else {
         m_impl = std::make_shared<ContinuousBatchingImpl>(model, tokenizer, scheduler_config, device, properties_without_draft_model_without_gguf, generation_config);
     }
@@ -194,6 +209,12 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline(
         }
     }
 
+    std::shared_ptr<SpeechEncoder> speech_encoder = nullptr;
+    if (std::filesystem::exists(directory / "openvino_encoder_model.xml")) {
+        std::cout << "Creating SpeechEncoder from " << (directory / "openvino_encoder_model.xml") << std::endl;
+        speech_encoder = std::make_shared<SpeechEncoder>(directory, device, properties_without_draft_model);
+    }
+
     utils::print_scheduler_config_info(scheduler_config);
 
     if (is_prompt_lookup_enabled) {
@@ -206,6 +227,8 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline(
         m_impl = std::make_shared<SpeculativeDecodingImpl>(main_model_descr, draft_model_desr);
     } else if (embedder) {
         m_impl = std::make_shared<ContinuousBatchingImpl>(model, embedder, tokenizer, scheduler_config, device, properties_without_draft_model, generation_config);
+    } else if (speech_encoder) {
+        m_impl = std::make_shared<ContinuousBatchingImpl>(model, speech_encoder, tokenizer, scheduler_config, device, properties_without_draft_model, generation_config);
     } else {
         m_impl = std::make_shared<ContinuousBatchingImpl>(model, tokenizer, scheduler_config, device, properties_without_draft_model, generation_config);
     }
@@ -243,6 +266,11 @@ GenerationHandle ContinuousBatchingPipeline::add_request(uint64_t request_id, co
 
 GenerationHandle ContinuousBatchingPipeline::add_request(uint64_t request_id, const std::string& prompt, const std::vector<ov::Tensor>& images, const std::vector<ov::Tensor>& videos, const ov::genai::GenerationConfig& sampling_params) {
     return m_impl->add_request(request_id, prompt, images, videos, sampling_params);
+}
+
+// Whisper specific
+GenerationHandle ContinuousBatchingPipeline::add_request(uint64_t request_id, const RawSpeechInput& raw_speech, const ov::genai::WhisperGenerationConfig& sampling_params) {
+    return m_impl->add_request(request_id, raw_speech, sampling_params);
 }
 
 void ContinuousBatchingPipeline::step() {

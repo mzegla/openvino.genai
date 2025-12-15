@@ -297,6 +297,7 @@ public:
     }
 };
 
+
 // contains a list of Sequences in generic case (beam search or parallel sampling)
 // - each sequence shares the same prompt and KV-caches for prompt
 // - in case of beam search each sequence also shares specific part of generic phase
@@ -314,6 +315,7 @@ class SequenceGroup  : public std::enable_shared_from_this<SequenceGroup> {
     size_t m_num_evicted_tokens = 0;
     bool m_has_echoed = false;
     SequenceGroupType m_sequence_group_type;
+    std::optional<ov::Tensor> m_encoder_hidden_state;
 
     uint64_t m_next_sequence_id = 0;
 
@@ -360,12 +362,23 @@ public:
 
     SequenceGroup(uint64_t request_id,
                   const ov::Tensor& input_ids,
+                  const ov::Tensor& encoder_hidden_state,
+                  const ov::genai::GenerationConfig& sampling_params,
+                  std::size_t block_size) : SequenceGroup(request_id, input_ids, sampling_params, block_size, std::nullopt, std::nullopt, std::nullopt) {
+        std::cout << "Sequence group constructor with encoder_hidden_state called\n";
+        m_encoder_hidden_state = encoder_hidden_state;
+        std::cout << "Sequence group constructor with encoder_hidden_state - data copy finished\n";
+    }
+
+    SequenceGroup(uint64_t request_id,
+                  const ov::Tensor& input_ids,
                   const ov::genai::GenerationConfig& sampling_params,
                   std::size_t block_size,
                   const std::optional<ov::Tensor>& token_type_ids = std::nullopt,
                   const std::optional<ov::Tensor>& position_ids = std::nullopt,
                   const std::optional<int64_t>& rope_delta = std::nullopt)
         : SequenceGroup(request_id, sampling_params, block_size) {
+        std::cout << "Calling almost base sequence group constructor\n";
         size_t prompt_len;
         size_t hidden_size = 0;
         if (input_ids.get_shape().size() > 1) {
@@ -381,6 +394,7 @@ public:
             std::copy_n(input_ids.data<int64_t>(), prompt_len, m_prompt_ids.begin());
             OPENVINO_SUPPRESS_DEPRECATED_END
             m_sequence_group_type = SequenceGroupType::TOKENS;
+            std::cout << "SequenceGroup constructor - m_prompt_ids populated\n";
         } else if (input_ids.get_element_type() == ov::element::f32) {
             hidden_size = input_ids.get_shape()[2];
             m_input_embeds.resize(prompt_len);
@@ -403,18 +417,21 @@ public:
             OPENVINO_THROW("Unknown tensor format.");
         }
         m_prompt_log_probs.reserve(prompt_len);
-
+        std::cout << "SequenceGroup constructor - m_prompt_log_probs reserved\n";
         auto sequence = Sequence::create(m_next_sequence_id++, m_sequence_group_type, hidden_size);
-
+        std::cout << "SequenceGroup constructor - Sequence created with id " << sequence->get_id() << "\n";
         if (position_ids.has_value()) {
+            std::cout << "SequenceGroup constructor - Setting position IDs\n";
             sequence->append_position_ids(*position_ids);
         }
         if (rope_delta.has_value()) {
+            std::cout << "SequenceGroup constructor - Setting rope delta\n";
             sequence->set_rope_delta(*rope_delta);
         }
-
+        std::cout << "SequenceGroup constructor - Position IDs and Rope Delta set if provided\n";
         // create a single sequence
         add_sequence(sequence);
+        std::cout << "SequenceGroup added sequence\n";
     }
 
     void add_sequence(const Sequence::Ptr & sequence) {
@@ -691,6 +708,10 @@ public:
     const std::vector<std::vector<float>>& get_input_embeds() const {
         OPENVINO_ASSERT(m_sequence_group_type == SequenceGroupType::EMBEDDINGS);
         return m_input_embeds;
+    }
+
+    const std::optional<ov::Tensor> get_encoder_hidden_state() const {
+        return m_encoder_hidden_state;
     }
 
     std::optional<std::vector<int64_t>> get_token_type_ids() const {
