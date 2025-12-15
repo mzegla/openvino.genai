@@ -78,8 +78,14 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
     bool allow_cache_rotation = scheduler_config.cache_eviction_config.apply_rotation;
     bool allow_xattention = scheduler_config.use_sparse_attention && scheduler_config.sparse_attention_config.mode == SparseAttentionMode::XATTENTION;
     bool allow_score_aggregation = true;
-    ov::pass::SDPAToPagedAttention(is_need_per_layer_cache_control, is_need_per_layer_cache_control, allow_score_aggregation, allow_cache_rotation, allow_xattention).run_on_model(model);
+    auto sdpa_to_pa_successful = ov::pass::SDPAToPagedAttention(is_need_per_layer_cache_control, is_need_per_layer_cache_control, allow_score_aggregation, allow_cache_rotation, allow_xattention).run_on_model(model);
+    if (sdpa_to_pa_successful) {
+        std::cout << "SDPA to Paged Attention transformation applied successfully.\n";
+    } else {
+        std::cout << "SDPA to Paged Attention transformation was not applied successfully.\n";
+    }
     utils::apply_gather_before_matmul_transformation(model);
+    ov::genai::utils::save_openvino_model(model, "paged_attention_transformed_model.xml", false);
 
     initialize_pipeline(model, scheduler_config, device, properties);
 }
@@ -97,6 +103,21 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
     // Note: set_inputs_embedder also sets the embedding model internally.
     m_model_runner->set_inputs_embedder(inputs_embedder);
     m_model_input_type = ModelInputType::EMBEDDINGS;
+}
+
+ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
+    const std::shared_ptr<ov::Model>& model,
+    std::shared_ptr<SpeechEncoder> speech_encoder,
+    const Tokenizer& tokenizer,
+    const SchedulerConfig& scheduler_config,
+    const std::string& device,
+    const ov::AnyMap& properties,
+    const ov::genai::GenerationConfig& generation_config,
+    bool is_validation_mode_enabled) : ContinuousBatchingImpl(model, tokenizer, scheduler_config, device, properties, generation_config, is_validation_mode_enabled){
+    m_speech_encoder = speech_encoder;
+    // Note: set_inputs_embedder also sets the embedding model internally.
+    // m_model_runner->set_inputs_embedder(inputs_embedder);
+    //m_model_input_type = ModelInputType::EMBEDDINGS;
 }
 
 ContinuousBatchingPipeline::ContinuousBatchingImpl::~ContinuousBatchingImpl() {
@@ -257,7 +278,8 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request(
     uint64_t request_id,
     const ov::Tensor& input_ids,
     const ov::genai::GenerationConfig& sampling_params,
-    std::optional<ov::Tensor> token_type_ids) {
+    std::optional<ov::Tensor> token_type_ids,
+    std::optional<ov::Tensor> encoder_hidden_state) {
     auto sampling_params_copy = sampling_params;
     // If stop_token_ids were not provided, take value from default m_generation_config
     if (sampling_params_copy.stop_token_ids.empty())
@@ -286,7 +308,12 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request(
                                                          rope_delta);
     }
     else {
-        sequence_group = std::make_shared<SequenceGroup>(request_id, input_ids, sampling_params_copy, m_block_size, token_type_ids);
+        if (encoder_hidden_state.has_value()) {
+            std::cout << "Creating SequenceGroup with encoder_hidden_state\n";
+            sequence_group = std::make_shared<SequenceGroup>(request_id, input_ids, *encoder_hidden_state, sampling_params_copy, m_block_size);
+        } else {
+            sequence_group = std::make_shared<SequenceGroup>(request_id, input_ids, sampling_params_copy, m_block_size, token_type_ids);
+        }
     }
 
     if (m_scheduler->get_config().enable_prefix_caching) {
@@ -297,7 +324,7 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request(
         std::lock_guard<std::mutex> lock{m_awaiting_requests_mutex};
         m_awaiting_requests.push_back(sequence_group);
     }
-
+    std::cout << "Added request " << request_id << " with prompt length " << prompt_len << "\n";
     return std::make_shared<GenerationHandleImpl>(sequence_group->get_generation_stream(), sampling_params_copy);
 }
 
@@ -322,6 +349,16 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request(uint64_t request
     return add_request(request_id, inputs, sampling_params);
 }
 
+GenerationHandle
+ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request(uint64_t request_id,
+                                 const ov::Tensor& input_ids,
+                                 const ov::Tensor& encoder_hidden_state,
+                                 const ov::genai::WhisperGenerationConfig& sampling_params) {
+    // TODO: Implement
+    std::cout << "ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request with encoder_hidden_state called\n";
+    return add_request(request_id, input_ids, GenerationConfig(), std::nullopt, encoder_hidden_state);
+}
+
 bool ContinuousBatchingPipeline::ContinuousBatchingImpl::has_non_finished_requests() {
     std::lock_guard<std::mutex> lock{m_awaiting_requests_mutex};
     return !m_awaiting_requests.empty() || !m_requests.empty();
@@ -331,8 +368,9 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
     static ManualTimer step_timer("step()");
     step_timer.start();
 
+    std::cout << "ContinuousBatchingPipeline::ContinuousBatchingImpl::step() - Pulling awaiting requests\n";
     _pull_awaiting_requests();
-
+    std::cout << "ContinuousBatchingPipeline::ContinuousBatchingImpl::step() - Scheduling\n";
     Scheduler::Output scheduler_output;
 
     {
@@ -369,6 +407,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
         return;
     }
     ov::Tensor logits;
+    std::cout << "ContinuousBatchingPipeline::ContinuousBatchingImpl::step() - Inference\n";
 
     {
         static ManualTimer timer("forward");
@@ -400,6 +439,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
     // process generation_config.echo parameter
     _fill_prompt_log_probs(m_requests, logits);
 
+    std::cout << "ContinuousBatchingPipeline::ContinuousBatchingImpl::step() - Sampling\n";
     SamplerOutput sampler_output;
     {
         static ManualTimer timer("sample");
@@ -440,7 +480,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
     }
 
     // free non running requests for current step
-
+    std::cout << "ContinuousBatchingPipeline::ContinuousBatchingImpl::step() - Free non running requests\n";
     {
         static ManualTimer clean_up_requests_timer("free non running requests");
         clean_up_requests_timer.start();

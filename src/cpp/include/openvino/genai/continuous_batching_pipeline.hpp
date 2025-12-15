@@ -18,6 +18,7 @@
 #include "openvino/genai/streamer_base.hpp"
 #include "openvino/genai/visibility.hpp"
 #include "openvino/genai/visual_language/pipeline.hpp"
+#include "openvino/genai/whisper_pipeline.hpp"
 
 #include "openvino/genai/cache_eviction.hpp"
 
@@ -167,6 +168,9 @@ public:
     GenerationHandle add_request(uint64_t request_id, const std::string& prompt, const ov::genai::GenerationConfig& sampling_params);
     GenerationHandle add_request(uint64_t request_id, const std::string& prompt, const std::vector<ov::Tensor>& images, const std::vector<ov::Tensor>& videos, const ov::genai::GenerationConfig& sampling_params);
     GenerationHandle add_request(uint64_t request_id, const std::string& prompt, const std::vector<ov::Tensor>& images, const ov::genai::GenerationConfig& sampling_params);
+
+    // Whisper specific
+    GenerationHandle add_request(uint64_t request_id, const RawSpeechInput& raw_speech, const ov::genai::WhisperGenerationConfig& sampling_params);
 
     void step();
 

@@ -119,7 +119,8 @@ GenerationHandle
 ContinuousBatchingPipeline::SpeculativeDecodingImpl::add_request(uint64_t request_id,
                                                                  const ov::Tensor& input_ids,
                                                                  const ov::genai::GenerationConfig& sampling_params,
-                                                                 std::optional<ov::Tensor> token_type_ids) {
+                                                                 std::optional<ov::Tensor> token_type_ids,
+                                                                 std::optional<ov::Tensor> encoder_hidden_state) {
     std::lock_guard<std::mutex> lock(m_draft_generations_mutex);
     auto draft_sampling_params = sampling_params;
     draft_sampling_params.ignore_eos = true;
@@ -138,6 +139,15 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::add_request(uint64_t reques
     draft_sampling_params.stop_strings = {};
     m_draft_generations.insert({request_id, m_draft_pipeline->add_request(request_id, prompt, draft_sampling_params)});
     return m_main_pipeline->add_request(request_id, prompt, sampling_params);
+}
+
+GenerationHandle
+ContinuousBatchingPipeline::SpeculativeDecodingImpl::add_request(uint64_t request_id,
+                                                                 const ov::Tensor& input_ids,
+                                                                 const ov::Tensor& encoder_hidden_state,
+                                                                 const ov::genai::WhisperGenerationConfig& sampling_params) {
+    // NOT IMPLEMENTED - think about other way of handling Whisper with Speculative Decoding
+    return m_main_pipeline->add_request(request_id, input_ids, GenerationConfig());
 }
 
 bool ContinuousBatchingPipeline::SpeculativeDecodingImpl::has_non_finished_requests() {

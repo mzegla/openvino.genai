@@ -39,5 +39,22 @@ WhisperGenerateResult whisper_generate(const ov::genai::WhisperGenerationConfig&
                                        const std::shared_ptr<StreamerBase> streamer,
                                        Sampler& sampler);
 
+class SpeechEncoder {
+    // TODO: use pool of infer requests for better performance in multithreaded scenarios
+    ov::InferRequest m_encoder;
+    std::shared_ptr<WhisperDecoder> m_decoder;
+    WhisperFeatureExtractor m_feature_extractor;
+    WhisperConfig m_model_config;
+public:
+    SpeechEncoder(const std::filesystem::path& model_path,
+                  const std::string& device,
+                  const ov::AnyMap& properties);
+
+    // Encode raw speech into hidden states for each data frame in order
+    std::vector<std::pair<ov::Tensor, ov::Tensor>> encode(const RawSpeechInput& raw_speech,
+                                  const WhisperContextTokens& context_tokens,
+                                  const ov::genai::WhisperGenerationConfig& config);
+    };
+
 }  // namespace genai
 }  // namespace ov

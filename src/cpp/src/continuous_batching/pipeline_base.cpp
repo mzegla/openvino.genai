@@ -430,6 +430,33 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(
     return add_request(request_id, inputs, std::move(sampling_params));
 }
 
+GenerationHandle
+ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(
+    uint64_t request_id,
+    const RawSpeechInput& raw_speech,
+    const WhisperGenerationConfig& sampling_params) {
+    // Run speech through the encoder to get hidden states for the decoder
+    std::vector<std::pair<ov::Tensor, ov::Tensor>> decoder_inputs;
+    auto [context_tokens, tokenization_duration_microseconds] = prepare_context_tokens(sampling_params, m_tokenizer);
+    {
+        std::lock_guard<std::mutex> lock(m_speech_encoder_mutex);
+        decoder_inputs = m_speech_encoder->encode(raw_speech, context_tokens, sampling_params);
+    }
+
+    // For initial tests process only first frame
+    auto& [input_ids, encoder_hidden_states] = decoder_inputs[0];
+    std::cout << "Calling internal add_request with input_ids shape: ";
+    for (const auto& dim : input_ids.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << " and encoder_hidden_states shape: ";
+    for (const auto& dim : encoder_hidden_states.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
+    return add_request(request_id, input_ids, encoder_hidden_states, sampling_params);
+}
+
 void ContinuousBatchingPipeline::IContinuousBatchingPipeline::stream_tokens(
     const std::shared_ptr<ThreadedStreamerWrapper>& streamer_ptr,
     const GenerationHandle& handle

@@ -165,9 +165,10 @@ public:
             total_num_blocks += sequence_group->get_num_blocks() * num_sequences;
             max_context_len_val = std::max(max_context_len_val, sequence_group->get_context_len());
         }
-
+        std::cout << "ModelRunner forward total_num_tokens: " << total_num_tokens << "\n";
+        std::cout << "ModelRunner forward batch_size_in_sequences: " << batch_size_in_sequences << "\n";
         // Use cached pre-allocated tensors instead of creating new ones
-        ov::Tensor input_ids = _get_or_resize_tensor(m_cached_input_ids, "input_ids", {total_num_tokens}, ov::element::i64);
+        ov::Tensor input_ids = _get_or_resize_tensor(m_cached_input_ids, "input_ids", {1, total_num_tokens}, ov::element::i64);
         ov::Tensor inputs_embeds = _get_or_resize_tensor(m_cached_inputs_embeds, "inputs_embeds",
             {total_num_tokens, hidden_size}, ov::element::f32);
         // PA specific parameters
@@ -234,6 +235,7 @@ public:
             matmul_gathering_is_available = true;
         } catch (const ov::Exception&) {}
 
+        std::cout << "ModelRunner forward preparing inputs for the infer request.\n";
         std::map<size_t, std::set<size_t>> seq_id_to_skipped_blocks_map;
         size_t position_ids_idx = 0;
         for (size_t i = 0; i < num_sequence_groups; ++i) {
@@ -356,42 +358,109 @@ public:
         // Score_aggregation_window might be not managed through the cached tensor system in some case as it is created unconditionally, and need to be set to a ireq.
         // To align these tensors' behavior, set each tensor when it is not cached.
 
+        std::cout << "ModelRunner Infer Request input tensors:\n";
+        auto& inputs = m_request.get_compiled_model().inputs();
+        for (const auto& input : inputs) {
+            std::cout << "  " << input.get_any_name() << "; shape " << input.get_partial_shape() << "\n";
+        }
+        std::cout << "ModelRunner forward setting tensors into the infer request.\n";
+        if (sequence_groups[0]->get_encoder_hidden_state().has_value()) {
+            ov::Tensor encoder_hidden_state = sequence_groups[0]->get_encoder_hidden_state().value();
+            std::cout << "ModelRunner encoder hidden state tensor shape: ";
+            for (const auto& dim : encoder_hidden_state.get_shape()) {
+                std::cout << dim << " ";
+            }
+            std::cout << "\n";
+            m_request.set_tensor("encoder_hidden_states", encoder_hidden_state);
+        }
+        std::cout << "ModelRunner encoder hidden state set if available.\n";
         if (sequence_group_type == SequenceGroupType::TOKENS && !m_cached_input_ids) {
+            std::cout << "Setting input_ids with shape: ";
+            for (const auto& dim : input_ids.get_shape()) {
+            std::cout << dim << " ";
+            }
+            std::cout << "\n";
             m_request.set_tensor("input_ids", input_ids);
         }
         else if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
             if (!m_cached_inputs_embeds) {
-                m_request.set_tensor("inputs_embeds", inputs_embeds);
+            std::cout << "Setting inputs_embeds with shape: ";
+            for (const auto& dim : inputs_embeds.get_shape()) {
+                std::cout << dim << " ";
+            }
+            std::cout << "\n";
+            m_request.set_tensor("inputs_embeds", inputs_embeds);
             }
             if (have_token_type_ids && !m_cached_token_type_ids) {
-                m_request.set_tensor("token_type_ids", token_type_ids);
+            std::cout << "Setting token_type_ids with shape: ";
+            for (const auto& dim : token_type_ids.get_shape()) {
+                std::cout << dim << " ";
+            }
+            std::cout << "\n";
+            m_request.set_tensor("token_type_ids", token_type_ids);
             }
         }
+
+        std::cout << "ModelRunner input ids or input embeds set.\n";
         if (position_ids.get_shape().size() == 3) {
             // flatten positions ids for 3D position ids case
             position_ids.set_shape({ov::shape_size(position_ids.get_shape())});
         }
         // typical LLM parameters
         if (!m_cached_position_ids) {
+            std::cout << "Setting position_ids with shape: ";
+            for (const auto& dim : position_ids.get_shape()) {
+            std::cout << dim << " ";
+            }
+            std::cout << "\n";
             m_request.set_tensor("position_ids", position_ids);
         }
+        std::cout << "ModelRunner position ids set if available.\n";
         // PA specific parameters
         if (!m_cached_past_lens) {
+            std::cout << "Setting past_lens with shape: ";
+            for (const auto& dim : past_lens.get_shape()) {
+            std::cout << dim << " ";
+            }
+            std::cout << "\n";
             m_request.set_tensor("past_lens", past_lens);
         }
+        std::cout << "ModelRunner past lens set if available.\n";
         if (!m_cached_subsequence_begins) {
+            std::cout << "Setting subsequence_begins with shape: ";
+            for (const auto& dim : subsequence_begins.get_shape()) {
+            std::cout << dim << " ";
+            }
+            std::cout << "\n";
             m_request.set_tensor("subsequence_begins", subsequence_begins);
         }
+        std::cout << "ModelRunner subsequence begins set if available.\n";
 
+        std::cout << "ModelRunner forward setting block indices.\n";
         _set_block_indices(sequence_groups, scheduler_output, total_num_blocks, seq_id_to_skipped_blocks_map);
 
         if (!m_cached_block_indices_begins) {
+            std::cout << "Setting block_indices_begins with shape: ";
+            for (const auto& dim : block_indices_begins.get_shape()) {
+            std::cout << dim << " ";
+            }
+            std::cout << "\n";
             m_request.set_tensor("block_indices_begins", block_indices_begins);
         }
         if (!m_cached_max_context_len) {
+            std::cout << "Setting max_context_len with shape: ";
+            for (const auto& dim : max_context_len.get_shape()) {
+            std::cout << dim << " ";
+            }
+            std::cout << "\n";
             m_request.set_tensor("max_context_len", max_context_len);
         }
         if (m_is_use_rotation_inputs) {
+            std::cout << "Setting rotation_trig_lut with shape: ";
+            for (const auto& dim : m_cache_rotation_trig_lut.get_shape()) {
+            std::cout << dim << " ";
+            }
+            std::cout << "\n";
             m_request.set_tensor("rotation_trig_lut", m_cache_rotation_trig_lut);
             _set_cache_rotation_coefficients(sequence_groups, scheduler_output);
         }
@@ -400,6 +469,7 @@ public:
             _set_xattention_tensors(sequence_groups, scheduler_output, batch_size_in_sequences);
         }
 
+        std::cout << "ModelRunner forward preparing gather indices if required.\n";
         if (matmul_gathering_is_available) {
             // use pre-allocated tensor for gather_indices as well
             ov::Tensor gather_indices = m_request.get_tensor("sampled_tokens_indices");
@@ -408,22 +478,38 @@ public:
         }
 
         if (m_is_aggregate_attention_scores && !m_cached_score_aggregation_window) {
+            std::cout << "Setting score_aggregation_window with shape: ";
+            for (const auto& dim : score_aggregation_window.get_shape()) {
+            std::cout << dim << " ";
+            }
+            std::cout << "\n";
             m_request.set_tensor("score_aggregation_window", score_aggregation_window);
         }
 
+        std::cout << "ModelRunner forward starting inference.\n";
         {
             static ManualTimer timer("pure generate inference");
             timer.start();
-            m_request.infer();
+            try {
+                m_request.infer();
+            } catch (const std::exception& e) {
+                std::cerr << "Error during inference: " << e.what() << std::endl;
+                throw;
+            }
             timer.end();
         }
+
+        std::cout << "ModelRunner forward completed inference. Collecting attention scores if enabled.\n";
 
         if (m_collect_attention_scores) {
             _collect_attention_scores(sequence_groups, scheduler_output);
         }
 
+        std::cout << "Model Runner reseting cache rotation coefficients.\n";
+
         _reset_cache_rotation_coefficients();
 
+        std::cout << "ModelRunner forward finished. Returning logits\n";
         // return logits
         return m_request.get_tensor("logits");
     }

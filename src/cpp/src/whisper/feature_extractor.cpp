@@ -481,6 +481,7 @@ void WhisperFeatureExtractor::init_mel_filter() {
 
 WhisperFeatures WhisperFeatureExtractor::extract(const std::vector<float>& raw_speech) {
     size_t n_threads = std::min(4, (int32_t)std::thread::hardware_concurrency());
+    std::cout << "Using " << n_threads << " threads for feature extraction." << std::endl;
     return mel_spectrogram_convert_audio(raw_speech,
                                          sampling_rate,
                                          feature_size,

@@ -16,7 +16,8 @@ GenerationHandle
 ContinuousBatchingPipeline::PromptLookupImpl::add_request(uint64_t request_id,
                                                           const ov::Tensor& input_ids,
                                                           const ov::genai::GenerationConfig& sampling_params,
-                                                          std::optional<ov::Tensor> token_type_ids) {
+                                                          std::optional<ov::Tensor> token_type_ids,
+                                                          std::optional<ov::Tensor> encoder_hidden_state) {
     OPENVINO_ASSERT(sampling_params.is_prompt_lookup(), "`max_ngram_size` && `num_assistant_tokens` should be specified for `prompt lookup decoding`");
     return m_pipeline->add_request(request_id, input_ids, sampling_params, token_type_ids);
 }
@@ -27,6 +28,15 @@ ContinuousBatchingPipeline::PromptLookupImpl::add_request(uint64_t request_id,
                                                           const ov::genai::GenerationConfig& sampling_params) {
     OPENVINO_ASSERT(sampling_params.is_prompt_lookup(), "`max_ngram_size` && `num_assistant_tokens` should be specified for `prompt lookup decoding`");
     return m_pipeline->add_request(request_id, prompt, sampling_params);
+}
+
+GenerationHandle
+ContinuousBatchingPipeline::PromptLookupImpl::add_request(uint64_t request_id,
+                                                                 const ov::Tensor& input_ids,
+                                                                 const ov::Tensor& encoder_hidden_state,
+                                                                 const ov::genai::WhisperGenerationConfig& sampling_params) {
+    // NOT IMPLEMENTED - think about other way of handling Whisper with Prompt Lookup Decoding
+    return m_pipeline->add_request(request_id, input_ids, GenerationConfig());
 }
 
 bool ContinuousBatchingPipeline::PromptLookupImpl::has_non_finished_requests() {
