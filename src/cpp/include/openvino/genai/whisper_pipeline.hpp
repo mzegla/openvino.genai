@@ -98,6 +98,20 @@ struct WhisperDecodedResults {
     }
 };
 
+class WhisperPipelinePocImpl;
+class WhisperPipelinePoc {
+    std::unique_ptr<WhisperPipelinePocImpl> m_impl;
+public:
+    WhisperPipelinePoc(const std::filesystem::path& models_path, const std::string& device, const ov::AnyMap& properties = {});
+
+    void generate(const RawSpeechInput& raw_speech_input,
+                  bool batched_mode,
+                  OptionalWhisperGenerationConfig generation_config = std::nullopt,
+                  const std::shared_ptr<StreamerBase> streamer = nullptr);
+
+    ~WhisperPipelinePoc();
+};
+
 /**
  * @brief Automatic speech recognition pipeline
  */

@@ -262,20 +262,32 @@ public:
         ov::Tensor input_ids = _get_or_resize_tensor(m_cached_input_ids, "input_ids", {total_num_tokens}, ov::element::i64);
         ov::Tensor inputs_embeds = _get_or_resize_tensor(m_cached_inputs_embeds, "inputs_embeds",
             {total_num_tokens, hidden_size}, ov::element::f32);
+        std::cout << "inputs_embeds shape: " << inputs_embeds.get_shape() << "\n";
+        
         // PA specific parameters
         ov::Tensor past_lens = _get_or_resize_tensor(m_cached_past_lens, "past_lens",
             {batch_size_in_sequences}, ov::element::i32);
+        std::cout << "past_lens shape: " << past_lens.get_shape() << "\n";
+        
         ov::Tensor subsequence_begins = _get_or_resize_tensor(m_cached_subsequence_begins, "subsequence_begins", 
             {batch_size_in_sequences + 1}, ov::element::i32);
+        std::cout << "subsequence_begins shape: " << subsequence_begins.get_shape() << "\n";
+        
         ov::Tensor block_indices_begins = _get_or_resize_tensor(m_cached_block_indices_begins, "block_indices_begins", 
             {batch_size_in_sequences + 1}, ov::element::i32);
+        std::cout << "block_indices_begins shape: " << block_indices_begins.get_shape() << "\n";
+        
         ov::Tensor max_context_len = _get_or_resize_tensor(m_cached_max_context_len, "max_context_len", 
             {}, ov::element::i32);
+        std::cout << "max_context_len shape: " << max_context_len.get_shape() << "\n";
 
         ov::Tensor token_type_ids = _get_or_resize_tensor(m_cached_token_type_ids, "token_type_ids",
             {1, total_num_tokens}, ov::element::i64);
+        std::cout << "token_type_ids shape: " << token_type_ids.get_shape() << "\n";
+        
         ov::Tensor score_aggregation_window = _get_or_resize_tensor(m_cached_score_aggregation_window, "score_aggregation_window",
             {batch_size_in_sequences}, ov::element::i32);
+        std::cout << "score_aggregation_window shape: " << score_aggregation_window.get_shape() << "\n";
 
         ov::Tensor hidden_state_input = _prepare_hidden_state_input(total_num_tokens, hidden_size);
         float* hidden_state_data = nullptr;
@@ -774,9 +786,11 @@ private:
             // If cached tensor is not initialized, try to get the tensor from the m_request.
             try {
                 cached_tensor = m_request.get_tensor(tensor_name);
+                std::cout << "Got tensor from request: " << tensor_name << "\n";
             } catch (const ov::Exception&) {
                 // Fall back to default construction methods when exception occurs.
                 // For example, score_aggregation_window may not be used by a model but a Tensor is required for following operation.
+                std::cout << "Fall back initiated for tensor: " << tensor_name << "\n";
                 return ov::Tensor(element_type, required_shape);
             }
        }
