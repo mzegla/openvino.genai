@@ -158,7 +158,10 @@ int main(int argc, char* argv[]) try {
         ov_config = get_config_for_cache();
     }
 
-    ov::genai::WhisperPipeline pipeline(models_path.parent_path() / (models_path.filename().string() + "-stateful"), device);
+    // Word timestamps require decomposition of cross-attention decoder SDPA layers,
+    // so word_timestamps must be passed to the pipeline constructor (not just in generation config)
+    ov_config.insert(ov::genai::word_timestamps(true));
+    ov::genai::WhisperPipeline pipeline(models_path.parent_path() / (models_path.filename().string() + "-stateful"), device, ov_config);
 
     ov::genai::WhisperGenerationConfig config = pipeline.get_generation_config();
     // 'task' and 'language' parameters are supported for multilingual models only

@@ -9,10 +9,147 @@
 #include "whisper/models/decoder.hpp"
 #include "whisper/logit_processor.hpp"
 
+// Standard library
+#include <limits>
+
+// OpenVINO pass and pattern matching headers
+#include "openvino/pass/manager.hpp"
+#include "openvino/pass/pattern/op/wrap_type.hpp"
+#include "openvino/pass/pattern/matcher.hpp"
+
+// OpenVINO operations
+#include "openvino/op/constant.hpp"
+#include "openvino/op/parameter.hpp"
+#include "openvino/op/add.hpp"
+#include "openvino/op/equal.hpp"
+#include "openvino/op/select.hpp"
+#include "openvino/op/unsqueeze.hpp"
+#include "openvino/op/scaled_dot_product_attention.hpp"
+
 namespace ov {
 namespace genai {
 
-static constexpr int NUM_LAYERS = 12;
+namespace {
+
+// Check if model already has attention_mask input
+bool has_attention_mask_input(const std::shared_ptr<ov::Model>& model) {
+    for (const auto& input : model->inputs()) {
+        if (input.get_any_name() == "attention_mask") {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Add attention_mask input to decoder model for continuous batching
+// This function modifies the model graph to accept dynamic attention masks
+// for handling sequences of different lengths in batch processing
+void add_attention_mask_input(std::shared_ptr<ov::Model> model, bool for_cross_attention = false) {
+    using namespace ov::op;
+
+    if (has_attention_mask_input(model)) {
+        std::cout << "Model already has attention_mask input, skipping transformation\n";
+        return;
+    }
+
+    std::vector<std::shared_ptr<ov::Node>> self_attn_nodes;
+    std::vector<std::shared_ptr<ov::Node>> cross_attn_nodes;
+    const auto kAttnMaskPort = 3;
+
+    // Find all ScaledDotProductAttention nodes and classify them
+    for (const auto& node : model->get_ops()) {
+        if (ov::is_type<ov::op::v13::ScaledDotProductAttention>(node)) {
+            // Use node name to distinguish: cross-attention has "encoder_attn" in name
+            std::string node_name = node->get_friendly_name();
+            if (node_name.find("encoder_attn") != std::string::npos || 
+                node_name.find("cross_attn") != std::string::npos) {
+                // Cross-attention node - don't modify
+                cross_attn_nodes.push_back(node);
+            } else {
+                // Self-attention node - needs our mask
+                self_attn_nodes.push_back(node);
+            }
+        }
+    }
+
+    std::cout << "Found " << self_attn_nodes.size() << " self-attention SDPA nodes\n";
+    std::cout << "Found " << cross_attn_nodes.size() << " cross-attention SDPA nodes\n";
+
+    if (self_attn_nodes.empty() && cross_attn_nodes.empty()) {
+        std::cout << "No SDPA nodes found in model\n";
+        return;
+    }
+
+    // Create attention_mask parameter with dynamic shape
+    auto attention_mask = std::make_shared<v0::Parameter>(
+        ov::element::f32, 
+        ov::PartialShape{-1, -1}  // [batch_size, seq_len]
+    );
+    attention_mask->get_output_tensor(0).set_names({"attention_mask"});
+    model->add_parameters({attention_mask});
+
+    std::cout << "Added attention_mask parameter to model\n";
+
+    // Create constants for mask transformation
+    auto cst_minus_inf = std::make_shared<v0::Constant>(
+        ov::element::f32, ov::Shape{1}, 
+        std::vector<float>{-std::numeric_limits<float>::infinity()}
+    );
+    auto cst_zero = std::make_shared<v0::Constant>(
+        ov::element::f32, ov::Shape{1}, std::vector<float>{0.0f}
+    );
+    auto cst_one = std::make_shared<v0::Constant>(
+        ov::element::f32, ov::Shape{1}, std::vector<float>{1.0f}
+    );
+    auto cst_axis_1 = std::make_shared<v0::Constant>(ov::element::i32, ov::Shape{1}, std::vector<int32_t>{1});
+    auto cst_axis_2 = std::make_shared<v0::Constant>(ov::element::i32, ov::Shape{1}, std::vector<int32_t>{2});
+
+    // Convert attention mask: 1 -> 0.0 (attend), 0 -> -inf (mask)
+    auto equal = std::make_shared<v1::Equal>(attention_mask->output(0), cst_one->output(0));
+    auto select = std::make_shared<v1::Select>(
+        equal->output(0), 
+        cst_zero->output(0), 
+        cst_minus_inf->output(0)
+    );
+
+    // Reshape from [batch_size, seq_len] to [batch_size, 1, 1, seq_len] for SDPA
+    // SDPA expects [batch_size, num_heads, seq_len_q, seq_len_k]
+    // We provide [batch_size, 1, 1, seq_len_k] which broadcasts across heads and query positions
+    auto unsqueeze_1 = std::make_shared<v0::Unsqueeze>(select->output(0), cst_axis_1->output(0));
+    auto unsqueeze_2 = std::make_shared<v0::Unsqueeze>(unsqueeze_1->output(0), cst_axis_2->output(0));
+
+    // Apply transformed mask ONLY to self-attention nodes
+    for (const auto& sdpa_node : self_attn_nodes) {
+        if (sdpa_node->inputs().size() > kAttnMaskPort) {
+            // Has existing mask - combine with our mask using Add
+            // This preserves causal masking while adding padding mask
+            auto existing_mask = sdpa_node->input(kAttnMaskPort).get_source_output();
+            auto combined_mask = std::make_shared<v1::Add>(existing_mask, unsqueeze_2->output(0));
+            sdpa_node->input(kAttnMaskPort).replace_source_output(combined_mask->output(0));
+        } else {
+            // No mask input - create new SDPA with mask
+            auto new_sdpa = std::make_shared<v13::ScaledDotProductAttention>(
+                sdpa_node->input(0).get_source_output(),
+                sdpa_node->input(1).get_source_output(),
+                sdpa_node->input(2).get_source_output(),
+                unsqueeze_2->output(0),
+                false  // causal
+            );
+            ov::replace_node(sdpa_node, new_sdpa);
+        }
+    }
+
+    std::cout << "Connected attention_mask to " << self_attn_nodes.size() << " self-attention SDPA nodes\n";
+    std::cout << "Left " << cross_attn_nodes.size() << " cross-attention SDPA nodes unchanged\n";
+    
+    model->validate_nodes_and_infer_types();
+    std::cout << "Model transformation completed successfully\n";
+}
+
+}  // anonymous namespace
+
+
+static constexpr int NUM_LAYERS = 4;
 class WhisperSpeechEncoder {
     // TODO: use pool of infer requests for better performance in multithreaded scenarios
     ov::InferRequest m_encoder;
@@ -70,7 +207,7 @@ public:
         auto compiled_model = core.compile_model(model, device, properties);
         m_encoder = compiled_model.create_infer_request();
         // For now stateful decoder to create init input_ids 
-        m_decoder = WhisperDecoder::from_path(models_path, device, properties, m_encoder.get_compiled_model().output("last_hidden_state").get_partial_shape());
+        m_decoder = WhisperDecoder::from_path(models_path, device, properties, m_encoder.get_compiled_model().output("last_hidden_state").get_partial_shape(), true);
     }
 
     // Encode raw speech into decoder inputs (input_ids and encoder_hidden_state) for each chunk
@@ -177,6 +314,7 @@ public:
     ov::InferRequest m_request_decoder_with_past;
 
     bool initial_step = true;
+    size_t m_sequence_position = 0;  // Track total tokens processed (for attention_mask)
 
     float m_load_time_ms = 0;
 
@@ -187,11 +325,13 @@ public:
           m_model_config{models_path / "config.json"} {
             ov::Core core = utils::singleton_core();
             auto decoder_model = core.read_model(models_path / "openvino_decoder_model.xml");
+            add_attention_mask_input(decoder_model);  // Add attention mask support
             auto compiled_decoder_model = core.compile_model(decoder_model, device, properties);
-            m_request_decoder = compiled_decoder_model.create_infer_request();
 
             auto decoder_with_past_model = core.read_model(models_path / "openvino_decoder_with_past_model.xml");
+            add_attention_mask_input(decoder_with_past_model);  // Add for with_past too
             auto compiled_decoder_with_past_model = core.compile_model(decoder_with_past_model, device, properties);
+            m_request_decoder = compiled_decoder_model.create_infer_request();
             m_request_decoder_with_past = compiled_decoder_with_past_model.create_infer_request();
 
             // Print decoder inputs
@@ -268,6 +408,17 @@ public:
         m_request_decoder.set_tensor("encoder_hidden_states", encoder_hidden_state_copy);
         m_request_decoder.set_tensor("input_ids", input_ids_copy);
 
+        // Set attention_mask (all ones - no padding)
+        std::cout << "Setting attention_mask tensor - Shape: " << input_ids_copy.get_shape() 
+              << ", Type: " << ov::element::f32 << std::endl;
+        auto input_shape = input_ids_copy.get_shape();
+        ov::Tensor attention_mask(ov::element::f32, input_shape);
+        std::fill_n(attention_mask.data<float>(), attention_mask.get_size(), 1.0f);
+        m_request_decoder.set_tensor("attention_mask", attention_mask);
+
+        // Initialize sequence position
+        m_sequence_position = input_shape[1];
+
         // Run inference
         m_request_decoder.infer();
 
@@ -341,6 +492,14 @@ public:
         m_request_decoder_with_past.set_tensor("input_ids", input_ids);
         //std::cout << "Set input_ids tensor - Shape: " << input_ids.get_shape() 
         //          << ", Type: " << input_ids.get_element_type() << std::endl;
+
+        // Increment sequence position for the new token
+        m_sequence_position++;
+
+        // Set attention_mask (all ones - no padding) with shape matching KV cache length
+        ov::Tensor attention_mask(ov::element::f32, {1, m_sequence_position});
+        std::fill_n(attention_mask.data<float>(), attention_mask.get_size(), 1.0f);
+        m_request_decoder_with_past.set_tensor("attention_mask", attention_mask);
 
         // Copy present outputs from previous step to past_key_values inputs for next step
         for (int layer = 0; layer < NUM_LAYERS; layer++) {
@@ -459,6 +618,7 @@ public:
 
     void reset_decoder() {
         initial_step = true;
+        m_sequence_position = 0;
         //m_request_decoder = m_request_decoder.get_compiled_model().create_infer_request();
         //m_request_decoder_with_past = m_request_decoder_with_past.get_compiled_model().create_infer_request();
     }
@@ -468,6 +628,15 @@ public:
         // Set inputs
         m_request_decoder.set_tensor("encoder_hidden_states", encoder_hidden_state);
         m_request_decoder.set_tensor("input_ids", input_ids);
+
+        // Set attention_mask (all ones - no padding)
+        auto input_shape = input_ids.get_shape();
+        ov::Tensor attention_mask(ov::element::f32, input_shape);
+        std::fill_n(attention_mask.data<float>(), attention_mask.get_size(), 1.0f);
+        m_request_decoder.set_tensor("attention_mask", attention_mask);
+
+        // Initialize sequence position for batched mode
+        m_sequence_position = input_shape[1];
 
         // Run inference
         m_request_decoder.infer();
@@ -539,6 +708,14 @@ public:
         m_request_decoder_with_past.set_tensor("input_ids", input_ids);
         //std::cout << "Set input_ids tensor - Shape: " << input_ids.get_shape() 
         //          << ", Type: " << input_ids.get_element_type() << std::endl;
+
+        // Increment sequence position for the new token
+        m_sequence_position++;
+
+        // Set attention_mask (all ones - no padding) with shape matching KV cache length
+        ov::Tensor attention_mask(ov::element::f32, {batch_size, m_sequence_position});
+        std::fill_n(attention_mask.data<float>(), attention_mask.get_size(), 1.0f);
+        m_request_decoder_with_past.set_tensor("attention_mask", attention_mask);
 
         // Copy present outputs from previous step to past_key_values inputs for next step
         for (int layer = 0; layer < NUM_LAYERS; layer++) {

@@ -317,33 +317,6 @@ WhisperGenerateResult whisper_generate(const ov::genai::WhisperGenerationConfig&
     const float frame_length_in_seconds =
         static_cast<float>(feature_extractor.hop_length) / feature_extractor.sampling_rate;
 
-    std::cout << input_features.n_frames << " frames extracted from input audio.\n";
-    auto input_data_with_padding = std::vector<float>();
-    auto batch_size = 0;
-    for (size_t chunk_offset = 0; chunk_offset < input_features.n_frames; chunk_offset += feature_extractor.nb_max_frames) {
-        batch_size++;
-        const float chunk_time_offset = chunk_offset * frame_length_in_seconds;
-        auto input_features_chunk = input_features.get_data_with_offset(chunk_offset, feature_extractor.nb_max_frames);
-        input_data_with_padding.insert(input_data_with_padding.end(),
-                                       input_features_chunk.begin(),
-                                       input_features_chunk.end());
-    }
-
-    
-    ov::Tensor hidden_state_tensor = encode(encoder,
-                                            input_data_with_padding,
-                                            batch_size,
-                                            feature_extractor.feature_size,
-                                            feature_extractor.nb_max_frames,
-                                            raw_metrics);
-
-    //std::cout << "Encoded hidden state tensor shape: ";
-    //for (const auto& dim : hidden_state_tensor.get_shape()) {
-    //    std::cout << dim << " ";
-    //}
-    //std::cout << std::endl;
-    //return result;
-
     for (size_t chunk_offset = 0; chunk_offset < input_features.n_frames; chunk_offset += segment_offset) {
         const float chunk_time_offset = chunk_offset * frame_length_in_seconds;
 
@@ -453,71 +426,5 @@ WhisperGenerateResult whisper_generate(const ov::genai::WhisperGenerationConfig&
 
     return result;
 }
-
-SpeechEncoder::SpeechEncoder(const std::filesystem::path& model_path, const std::string& device, const ov::AnyMap& properties)
-    : m_feature_extractor(model_path / "preprocessor_config.json"),
-      m_model_config(model_path / "config.json") {
-    std::cout << "Speech encoder constructor called" << std::endl;
-    ov::Core core;
-    auto model = core.read_model(model_path / "openvino_encoder_model.xml");
-    auto compiled_model = core.compile_model(model, device, properties);
-    m_encoder = compiled_model.create_infer_request();
-    // For now stateful decoder to create init input_ids 
-    m_decoder = WhisperDecoder::from_path(model_path, device, properties, m_encoder.get_compiled_model().output("last_hidden_state").get_partial_shape());
-}
-
-std::vector<std::pair<ov::Tensor, ov::Tensor>> SpeechEncoder::encode(const RawSpeechInput& raw_speech, const WhisperContextTokens& context_tokens, const ov::genai::WhisperGenerationConfig& config) {
-    std::cout << "Starting SpeechEncoder::encode\n";
-    auto input_features = m_feature_extractor.extract(raw_speech);
-    std::cout << "Extracted features: " << input_features.n_frames << " frames\n";
-    size_t segment_offset = 0;
-
-    OPENVINO_ASSERT(m_feature_extractor.sampling_rate != 0, "Sampling Rate for Feature Extractor is 0");
-    const float frame_length_in_seconds =
-        static_cast<float>(m_feature_extractor.hop_length) / m_feature_extractor.sampling_rate;
-
-    std::vector<std::pair<ov::Tensor, ov::Tensor>> decoder_inputs;
-    for (size_t chunk_offset = 0; chunk_offset < input_features.n_frames; chunk_offset += segment_offset) {
-        const float chunk_time_offset = chunk_offset * frame_length_in_seconds;
-
-        auto input_features_chunk = input_features.get_data_with_offset(chunk_offset, m_feature_extractor.nb_max_frames);
-        OPENVINO_ASSERT(input_features_chunk.size() == m_feature_extractor.feature_size * m_feature_extractor.nb_max_frames,
-                        "Mel spectrogram required size: ",
-                        m_feature_extractor.feature_size,
-                        " * ",
-                        m_feature_extractor.nb_max_frames,
-                        ". Actual size: ",
-                        input_features_chunk.size(),
-                        ".");
-        ov::Tensor input_tensor(ov::element::f32, {1, m_feature_extractor.feature_size, m_feature_extractor.nb_max_frames}, input_features_chunk.data());
-        m_encoder.set_tensor("input_features", input_tensor);
-        std::cout << "Running inference for chunk at offset " << chunk_offset << "\n";
-        m_encoder.infer();
-        std::cout << "Encoder inference completed\n";
-
-        // reset input tensor
-        auto devices = m_encoder.get_compiled_model().get_property(ov::execution_devices);
-        OPENVINO_ASSERT(devices.size() > 0, "No execution devices found!");
-        size_t batch_size = (devices[0] == "NPU") ? 1 : 0;
-        m_encoder.set_tensor("input_features", ov::Tensor(ov::element::f32, {batch_size, m_feature_extractor.feature_size, m_feature_extractor.nb_max_frames}));
-
-        ov::Tensor encoder_hidden_state = m_encoder.get_tensor("last_hidden_state");
-
-        ov::genai::RawPerfMetrics raw_metrics;
-        auto init_tokens = prepare_init_tokens(encoder_hidden_state, m_decoder, config, false, raw_metrics);
-        std::vector<int64_t> chunk_init_tokens = ov::genai::get_prompt_tokens(context_tokens, config, chunk_offset);
-        chunk_init_tokens.insert(chunk_init_tokens.end(), init_tokens.begin(), init_tokens.end());
-        // Limit to first 2 tokens only
-        size_t num_tokens = std::min(chunk_init_tokens.size(), size_t(2));
-        ov::Tensor input_ids = ov::Tensor{ov::element::i64, {1, num_tokens}, const_cast<int64_t*>(chunk_init_tokens.data())};
-
-        decoder_inputs.emplace_back(std::make_pair(input_ids, encoder_hidden_state));
-        segment_offset = input_features.n_frames;
-    }
-    std::cout << "SpeechEncoder::encode completed, returning " << decoder_inputs.size() << " chunks\n";
-    return decoder_inputs;
-}
-
-
 }  // namespace genai
 }  // namespace ov
