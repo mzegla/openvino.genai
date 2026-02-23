@@ -13,6 +13,8 @@
 #include "continuous_batching/scheduler.hpp"
 #include "continuous_batching/threaded_streamer.hpp"
 
+#include "whisper/whisper.hpp"
+
 namespace ov::genai {
 
 enum class ModelInputType {
@@ -70,6 +72,14 @@ protected:
 
     std::shared_ptr<VisionRegistry> m_vision_registry;
 
+    std::shared_ptr<SpeechEncoder> m_speech_encoder;
+    std::mutex m_speech_encoder_mutex;
+
+    // Stored when add_request(raw_speech, WhisperGenerationConfig) is called; used
+    // in step() to apply Whisper-specific logit processing (timestamp forcing, etc.)
+    WhisperGenerationConfig m_whisper_gen_config;
+    bool m_has_whisper_config = false;
+
     void stream_tokens(const std::shared_ptr<ThreadedStreamerWrapper>& streamer_ptr, const GenerationHandle& handle);
 public:
     GenerationConfig get_config() const;
@@ -83,7 +93,8 @@ public:
     virtual GenerationHandle add_request(uint64_t request_id,
                                          const ov::Tensor& input_ids,
                                          const GenerationConfig& sampling_params,
-                                         std::optional<ov::Tensor> token_type_ids = std::nullopt) = 0;
+                                         std::optional<ov::Tensor> token_type_ids = std::nullopt,
+                                         std::optional<ov::Tensor> encoder_hidden_state = std::nullopt) = 0;
 
     /**
      * Adds request to running queue based on string input
@@ -111,6 +122,21 @@ public:
                                  const std::vector<ov::Tensor>& images,
                                  const std::vector<ov::Tensor>& videos,
                                  GenerationConfig sampling_params);
+
+    /**
+     * Adds request to running queue based on encoded inputs and encoder hidden states
+     */
+    virtual GenerationHandle add_request(uint64_t request_id,
+                                         const ov::Tensor& input_ids,
+                                         const ov::Tensor& encoder_hidden_state,
+                                         const ov::genai::WhisperGenerationConfig& sampling_params) = 0;
+    /**
+     * Adds request to running queue based on raw speech input
+     * This step first runs speech through the encoder to get hidden states for the decoder
+     */
+    GenerationHandle add_request(uint64_t request_id,
+                                 const RawSpeechInput& raw_speech,
+                                 const WhisperGenerationConfig& sampling_params);
 
     /**
      * Checks whether server (pipeline) has non-finished requests and step() should be called within a loop

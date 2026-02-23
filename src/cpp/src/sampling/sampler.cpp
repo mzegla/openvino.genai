@@ -608,15 +608,24 @@ void register_new_token(const Token& sampled_token,
                         LogitProcessor& logit_processor,
                         bool is_extend_sequence,
                         bool is_validation_mode_enabled) {
+    std::cout << "DEBUG register_new_token: token_id=" << sampled_token.m_index 
+              << ", is_extend=" << is_extend_sequence 
+              << ", seq_id=" << running_sequence->get_id()
+              << ", current_len=" << running_sequence->get_generated_len() << "\n";
+    
     logit_processor.register_new_generated_token(sampled_token.m_index);
     if (is_extend_sequence) {
         running_sequence->append_token(sampled_token.m_index, sampled_token.m_log_prob);
+        std::cout << "  -> Token appended! New len=" << running_sequence->get_generated_len() << "\n";
+    } else {
+        std::cout << "  -> Token NOT appended (is_extend_sequence=false)\n";
     }
     if (!is_validation_mode_enabled &&
         logit_processor.get_assistant_confidence_threshold() > 0 &&
         (std::fabs(std::exp(sampled_token.m_log_prob)) < logit_processor.get_assistant_confidence_threshold() || sampled_token.m_log_prob == 0)) {
         auto sequence_group = running_sequence->get_sequence_group_ptr();
         sequence_group->pause_generation(true);
+        std::cout << "  -> Generation PAUSED due to low confidence\n";
     }
 };
 

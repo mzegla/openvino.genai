@@ -124,9 +124,17 @@ public:
     }
 
     void allocate_cache_if_needed(size_t num_kv_blocks) {
+        std::cout << "CacheManager::allocate_cache_if_needed called:\n";
+        std::cout << "  Requested num_kv_blocks: " << num_kv_blocks << "\n";
+        std::cout << "  Currently allocated (m_num_allocated_kv_blocks): " << m_num_allocated_kv_blocks << "\n";
+        std::cout << "  Number of decoder layers: " << m_num_decoder_layers << "\n";
+        
         if (m_num_allocated_kv_blocks >= num_kv_blocks) {
+            std::cout << "  -> Cache already sufficient, returning early\n";
             return;
         }
+        
+        std::cout << "  -> Proceeding with allocation...\n";
         try {
             m_num_allocated_kv_blocks = num_kv_blocks;
 
@@ -134,9 +142,12 @@ public:
             ov::Coordinate start_value{0,0,0,0};
 
             if (m_context) {// Allocate KV caches
+                std::cout << "  Using RemoteContext (GPU) path\\n";
                 for (size_t decoder_layer_id = 0; decoder_layer_id < m_num_decoder_layers; ++decoder_layer_id) {
                     ov::Shape value_cache_shape = set_kv_blocks(m_value_shapes[decoder_layer_id], num_kv_blocks);
                     ov::Shape key_cache_shape = set_kv_blocks(m_key_shapes[decoder_layer_id], num_kv_blocks);
+                    std::cout << "    Layer " << decoder_layer_id << ": key=" << key_cache_shape 
+                              << ", value=" << value_cache_shape << "\\n";
 
                     ov::Tensor key_cache = m_context.create_tensor(get_key_cache_precision(decoder_layer_id), key_cache_shape);
                     ov::Tensor value_cache = m_context.create_tensor(get_value_cache_precision(decoder_layer_id), value_cache_shape);
@@ -164,9 +175,12 @@ public:
                     update_request_tensor(decoder_layer_id);
                 }
             } else {
+                std::cout << "  Using CPU (non-RemoteContext) path\\n";
                 for (size_t decoder_layer_id = 0; decoder_layer_id < m_num_decoder_layers; ++decoder_layer_id) {
                     ov::Shape value_cache_shape = set_kv_blocks(m_value_shapes[decoder_layer_id], num_kv_blocks);
                     ov::Shape key_cache_shape = set_kv_blocks(m_key_shapes[decoder_layer_id], num_kv_blocks);
+                    std::cout << "    Layer " << decoder_layer_id << ": key=" << key_cache_shape 
+                              << ", value=" << value_cache_shape << "\\n";
 
                     ov::element::Type key_precision = get_key_cache_precision(decoder_layer_id);
                     ov::element::Type value_precision = get_value_cache_precision(decoder_layer_id);
@@ -218,6 +232,7 @@ public:
                     update_request_tensor(decoder_layer_id);
                 }
             }
+            std::cout << "  Allocation complete! m_num_allocated_kv_blocks now = " << m_num_allocated_kv_blocks << "\\n";
         }
         catch (ov::Exception& e) {
             if (std::string(e.what()).find("bad allocation") != std::string::npos) {

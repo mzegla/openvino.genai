@@ -7,6 +7,7 @@
 #include <optional>
 #include <variant>
 #include <vector>
+#include <future>
 
 #include "openvino/core/any.hpp"
 #include "openvino/genai/llm_pipeline.hpp"
@@ -108,6 +109,50 @@ public:
                   bool batched_mode,
                   OptionalWhisperGenerationConfig generation_config = std::nullopt,
                   const std::shared_ptr<StreamerBase> streamer = nullptr);
+
+    // Experimental: Continuous batching with BatchManager
+    // This method demonstrates dynamic batching where requests can be added/removed
+    // during generation, using zero-copy KV cache optimization when possible
+    void experimental_generate_with_continuous_batching(
+        const RawSpeechInput& raw_speech_input,
+        OptionalWhisperGenerationConfig generation_config = std::nullopt,
+        const std::shared_ptr<StreamerBase> streamer = nullptr);
+    
+    // === ASYNC CONTINUOUS BATCHING API ===
+    
+    /**
+     * @brief Start continuous batching mode with a dedicated generation thread.
+     * This enables fully asynchronous request processing where generation runs
+     * continuously in the background and requests can be submitted from any thread.
+     * 
+     * @param max_batch_size Maximum number of requests to process in parallel
+     */
+    void start_continuous_batching(size_t max_batch_size = 32);
+    
+    /**
+     * @brief Stop continuous batching mode and shutdown the generation thread.
+     * Waits for all pending requests to complete before returning.
+     */
+    void stop_continuous_batching();
+    
+    /**
+     * @brief Submit an audio generation request asynchronously.
+     * Returns immediately with a future that will contain the generated token IDs.
+     * 
+     * @param raw_speech_input Audio input to transcribe
+     * @param generation_config Optional generation configuration
+     * @return Future that resolves to vector of generated token IDs
+     * @throws std::runtime_error if continuous batching is not started
+     */
+    std::future<std::vector<int64_t>> generate_async(
+        const RawSpeechInput& raw_speech_input,
+        OptionalWhisperGenerationConfig generation_config = std::nullopt);
+    
+    /**
+     * @brief Check if continuous batching mode is currently running
+     * @return true if generation thread is active, false otherwise
+     */
+    bool is_continuous_batching_running() const;
 
     ~WhisperPipelinePoc();
 };

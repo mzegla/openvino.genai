@@ -27,11 +27,18 @@ public:
     std::vector<Tensor> get_alignments_heads_qks(
         const std::vector<std::pair<size_t, size_t>>& alignment_heads) override;
 
+    // Get the model2 with PagedAttention for self-attention layers
+    std::shared_ptr<ov::Model> get_model_with_paged_attention() const { return m_model_with_pa; }
+
 private:
     ov::InferRequest m_request;
     bool m_has_cache_position = true;
     void _set_cache_position_tensor(const size_t seq_len);
 
     bool m_decompose_cross_attention_spda_ops = false;
+    
+    // Model2: Copy of the decoder model with PagedAttention for self-attention layers only
+    // Cross-attention layers remain as SDPA
+    std::shared_ptr<ov::Model> m_model_with_pa;
 };
 }  // namespace ov::genai

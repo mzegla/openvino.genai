@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstdlib>
 #include <set>
+#include <sstream>
 
 #include <openvino/runtime/infer_request.hpp>
 
@@ -233,6 +234,12 @@ public:
      * @return An ov::Tensor with next-token logit scores for each sequence processed during this `forward` call.
      */
     ov::Tensor forward(const std::vector<SequenceGroup::Ptr> & sequence_groups, const Scheduler::Output& scheduler_output) {
+        std::cout << "\n=== ModelRunner::forward START ===\n";
+        std::cout << "Number of sequence groups scheduled: " << scheduler_output.m_scheduled_sequence_groups_ids.size() << "\n";
+        for (size_t i = 0; i < scheduler_output.m_scheduled_sequence_groups_ids.size(); ++i) {
+            size_t seq_group_id = scheduler_output.m_scheduled_sequence_groups_ids[i];
+            std::cout << "  Sequence group [" << i << "]: seq_group_id=" << seq_group_id << "\n";
+        }
         m_sequence_hidden_state_mapping.clear();
         size_t num_sequence_groups = scheduler_output.m_scheduled_sequence_groups_ids.size();
 
@@ -258,8 +265,34 @@ public:
             max_context_len_val = std::max(max_context_len_val, sequence_group->get_context_len());
         }
 
+        // Check what shape the model expects for input_ids (may be 1D or 2D depending on model)
+        ov::Shape input_ids_shape = {total_num_tokens};
+        try {
+            auto input_ids_param = m_request.get_compiled_model().input("input_ids");
+            auto expected_shape = input_ids_param.get_partial_shape();
+            if (expected_shape.rank().is_static() && expected_shape.rank().get_length() == 2) {
+                // Model expects 2D, create as [1, total_num_tokens]
+                input_ids_shape = {1, total_num_tokens};
+                std::cout << "Model expects 2D input_ids, will create [1, " << total_num_tokens << "]\n";
+            }
+        } catch (const ov::Exception&) {
+            // If input_ids not found, try decoder_input_ids
+            try {
+                auto input_ids_param = m_request.get_compiled_model().input("decoder_input_ids");
+                auto expected_shape = input_ids_param.get_partial_shape();
+                if (expected_shape.rank().is_static() && expected_shape.rank().get_length() == 2) {
+                    input_ids_shape = {1, total_num_tokens};
+                    std::cout << "Model expects 2D decoder_input_ids, will create [1, " << total_num_tokens << "]\n";
+                }
+            } catch (const ov::Exception&) {
+                // Default to 1D
+            }
+        }
+
         // Use cached pre-allocated tensors instead of creating new ones
-        ov::Tensor input_ids = _get_or_resize_tensor(m_cached_input_ids, "input_ids", {total_num_tokens}, ov::element::i64);
+        ov::Tensor input_ids = _get_or_resize_tensor(m_cached_input_ids, "input_ids", input_ids_shape, ov::element::i64);
+        std::cout << "Created input_ids tensor with shape: " << input_ids.get_shape() << ", is_cached=" << (m_cached_input_ids ? "true" : "false") << "\n";
+        
         ov::Tensor inputs_embeds = _get_or_resize_tensor(m_cached_inputs_embeds, "inputs_embeds",
             {total_num_tokens, hidden_size}, ov::element::f32);
         std::cout << "inputs_embeds shape: " << inputs_embeds.get_shape() << "\n";
@@ -320,8 +353,17 @@ public:
             position_ids = _get_or_resize_tensor(m_cached_position_ids, "position_ids", position_ids_shape, ov::element::i64);
         } else if (sequence_group_type == SequenceGroupType::TOKENS) {
             input_ids_data = input_ids.data<int64_t>();
+            std::cout << "Got input_ids_data pointer: " << (void*)input_ids_data << "\n";
+            std::cout << "input_ids tensor size: " << input_ids.get_size() << " elements\n";
+            std::cout << "input_ids initial values (before filling): ";
+            for (size_t i = 0; i < std::min<size_t>(5, input_ids.get_size()); ++i) {
+                std::cout << input_ids_data[i] << " ";
+            }
+            std::cout << "\n";
             position_ids = _get_or_resize_tensor(m_cached_position_ids, "position_ids", {total_num_tokens}, ov::element::i64);
         }
+        
+        std::cout << "Created position_ids tensor with shape: " << position_ids.get_shape() << ", is_cached=" << (m_cached_position_ids ? "true" : "false") << "\n";
 
         int64_t
             * position_ids_data = position_ids.data<int64_t>();
@@ -347,14 +389,24 @@ public:
         size_t current_token_idx = 0;
         std::map<size_t, std::set<size_t>> seq_id_to_skipped_blocks_map;
         size_t position_ids_idx = 0;
+        
+        std::cout << "\n=== TOKEN FILLING LOOP START ===\n";
+        std::cout << "num_sequence_groups: " << num_sequence_groups << "\n";
+        std::cout << "total_num_tokens: " << total_num_tokens << "\n";
+        
         for (size_t i = 0; i < num_sequence_groups; ++i) {
+            std::cout << "  Processing sequence group " << i << "\n";
             size_t seq_group_id = scheduler_output.m_scheduled_sequence_groups_ids[i];
+            std::cout << "  seq_group_id: " << seq_group_id << "\n";
             SequenceGroup::Ptr sequence_group = sequence_groups[seq_group_id];
             std::vector<Sequence::Ptr> running_sequences = sequence_group->get_running_sequences();
             size_t num_running_sequences = running_sequences.size();
+            std::cout << "  num_running_sequences: " << num_running_sequences << "\n";
             size_t num_scheduled_tokens = sequence_group->get_num_scheduled_tokens();
+            std::cout << "  num_scheduled_tokens: " << num_scheduled_tokens << "\n";
             size_t group_position_id = sequence_group->get_num_processed_tokens();
             size_t prompt_len = sequence_group->get_prompt_len();
+            std::cout << "  group_position_id: " << group_position_id << ", prompt_len: " << prompt_len << "\n";
 
             // Next variables are only for sliced matmul case
             size_t output_seq_len = 0;
@@ -363,6 +415,7 @@ public:
             const size_t tokens_to_sample_per_sequence = 1 + sequence_group->get_num_tokens_to_validate();
 
             for (size_t seq_idx = 0; seq_idx < num_running_sequences; ++seq_idx) {
+                std::cout << "    Processing running sequence " << seq_idx << "/" << num_running_sequences << "\n";
                 // compute token_type_ids for current sequence
                 if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
                     if (auto token_type_ids = sequence_group->get_token_type_ids()) {
@@ -420,12 +473,21 @@ public:
                         }
                     }
                 }
+                std::cout << "      About to fill tokens for sequence, num_scheduled_tokens=" << num_scheduled_tokens << "\n";
+                std::cout << "      sequence_group_type=" << (sequence_group_type == SequenceGroupType::TOKENS ? "TOKENS" : "EMBEDDINGS") << "\n";
+                
                 for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id, ++gathering_current_index) {
                     // compute token for current sequence
                     if (sequence_group_type == SequenceGroupType::TOKENS) {
-                        input_ids_data[token_id] = position_id < prompt_len ?
+                        std::cout << "        Filling token_id=" << token_id << " at position_id=" << position_id << "\n";
+                        int64_t token_value = position_id < prompt_len ?
                             sequence_group->get_prompt_ids()[position_id] :
                             sequence->get_generated_ids()[position_id - prompt_len];
+                        
+                        std::cout << "  Filling input_ids[" << token_id << "] = " << token_value 
+                                  << " (position_id=" << position_id << ", prompt_len=" << prompt_len << ")\n";
+                        
+                        input_ids_data[token_id] = token_value;
                         position_ids_data[position_ids_idx] = position_id;
                     } else if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
                         const auto& generated_embeds = sequence->get_generated_ids_embeds();
@@ -479,6 +541,7 @@ public:
 
                 // apply strides to shift to a next sequence
                 if (sequence_group_type == SequenceGroupType::TOKENS) {
+                    std::cout << "  Incrementing input_ids_data pointer by " << num_scheduled_tokens << "\n";
                     input_ids_data += num_scheduled_tokens;
                 } else if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
                     inputs_embeds_data += num_scheduled_tokens * hidden_size;
@@ -512,7 +575,42 @@ public:
         // Score_aggregation_window might be not managed through the cached tensor system in some case as it is created unconditionally, and need to be set to a ireq.
         // To align these tensors' behavior, set each tensor when it is not cached.
 
-        if (sequence_group_type == SequenceGroupType::TOKENS && !m_cached_input_ids) {
+        if (sequence_groups[0]->get_encoder_hidden_state().has_value()) {
+            ov::Tensor encoder_hidden_state = sequence_groups[0]->get_encoder_hidden_state().value();
+            std::cout << "DEBUG: Setting encoder_hidden_states - shape: [";
+            for (size_t i = 0; i < encoder_hidden_state.get_shape().size(); ++i) {
+                std::cout << encoder_hidden_state.get_shape()[i];
+                if (i < encoder_hidden_state.get_shape().size() - 1) std::cout << ", ";
+            }
+            std::cout << "], size: " << encoder_hidden_state.get_size() 
+                      << ", data_ptr: " << static_cast<const void*>(encoder_hidden_state.data()) << "\n";
+            
+            // Print first few values to verify it's not zeros
+            if (encoder_hidden_state.get_size() > 0) {
+                const float* data = encoder_hidden_state.data<const float>();
+                std::cout << "  First 10 values: ";
+                for (size_t i = 0; i < std::min<size_t>(10, encoder_hidden_state.get_size()); ++i) {
+                    std::cout << data[i] << " ";
+                }
+                std::cout << "\n";
+            }
+            
+            // NOTE: Do NOT call reset_state() here!
+            // Cross-attention K/V are stored via ReadValue/Assign stateful ops:
+            //   - Step 0: Assign writes K_proj(encoder_hidden_states) to state at end of forward pass
+            //   - Step 1+: ReadValue reads the cached K/V from state → SDPA correct
+            // reset_state() would zero the cross-attention state right before ReadValue reads it,
+            // causing zero K/V in SDPA → zero logits.
+            // Self-attention state is managed externally via key_cache/value_cache PA tensors,
+            // so it doesn't depend on reset_state() either.
+            m_request.set_tensor("encoder_hidden_states", encoder_hidden_state);
+            std::cout << "DEBUG: encoder_hidden_states tensor set successfully\n";
+        } else {
+            std::cout << "DEBUG: WARNING - No encoder_hidden_state in sequence_groups[0]! Decoder will have no encoder context!\n";
+        }
+        
+        // For input_ids, always set it (don't rely on cache) to handle potential rank mismatches
+        if (sequence_group_type == SequenceGroupType::TOKENS) {
             m_request.set_tensor("input_ids", input_ids);
         }
         else if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
@@ -530,6 +628,7 @@ public:
             // flatten positions ids for 3D position ids case
             position_ids.set_shape({ov::shape_size(position_ids.get_shape())});
         }
+        
         // typical LLM parameters
         if (!m_cached_position_ids) {
             m_request.set_tensor("position_ids", position_ids);
@@ -567,7 +666,22 @@ public:
             // use pre-allocated tensor for gather_indices as well
             ov::Tensor gather_indices = m_request.get_tensor("sampled_tokens_indices");
             gather_indices.set_shape({gather_indices_values.size()});
-            std::memcpy(gather_indices.data(), gather_indices_values.data(), gather_indices_values.size() * sizeof(int64_t));
+            std::cout << "DEBUG: sampled_tokens_indices element_type=" << gather_indices.get_element_type()
+                      << ", values to write: [";
+            for (size_t k = 0; k < gather_indices_values.size(); ++k) {
+                std::cout << gather_indices_values[k];
+                if (k + 1 < gather_indices_values.size()) std::cout << ", ";
+            }
+            std::cout << "]\n";
+            if (gather_indices.get_element_type() == ov::element::i32) {
+                // Model expects int32 but gather_indices_values is int64 - must convert
+                int32_t* dst = gather_indices.data<int32_t>();
+                for (size_t k = 0; k < gather_indices_values.size(); ++k) {
+                    dst[k] = static_cast<int32_t>(gather_indices_values[k]);
+                }
+            } else {
+                std::memcpy(gather_indices.data(), gather_indices_values.data(), gather_indices_values.size() * sizeof(int64_t));
+            }
         }
 
         if (m_is_aggregate_attention_scores && !m_cached_score_aggregation_window) {
@@ -575,10 +689,269 @@ public:
         }
 
         {
+            // Print final state of ALL input tensors right before inference
+            std::cout << "\n=== FINAL INFER REQUEST STATE (all tensors after set_tensor calls) ===\n";
+            auto& inputs = m_request.get_compiled_model().inputs();
+            for (const auto& input : inputs) {
+                std::cout << "  " << input.get_any_name() << "; expected_shape=" << input.get_partial_shape();
+                try {
+                    auto current_tensor = m_request.get_tensor(input.get_any_name());
+                    std::cout << ", ACTUAL_shape=" << current_tensor.get_shape();
+                } catch (...) {
+                    std::cout << ", ACTUAL_shape=<not set>";
+                }
+                std::cout << "\n";
+            }
+            
+            // Print key tensor data values
+            std::cout << "\n--- Key Tensor Data Values ---\n";
+            std::cout << "input_ids: ";
+            auto* input_ids_ptr = input_ids.data<int64_t>();
+            for (size_t i = 0; i < std::min<size_t>(10, input_ids.get_size()); ++i) {
+                std::cout << input_ids_ptr[i] << " ";
+            }
+            std::cout << "\n";
+            
+            std::cout << "position_ids: ";
+            auto* pos_ptr = position_ids.data<int64_t>();
+            for (size_t i = 0; i < std::min<size_t>(10, position_ids.get_size()); ++i) {
+                std::cout << pos_ptr[i] << " ";
+            }
+            std::cout << "\n";
+            
+            std::cout << "past_lens: ";
+            auto* past_lens_ptr = past_lens.data<int32_t>();
+            for (size_t i = 0; i < past_lens.get_size(); ++i) {
+                std::cout << past_lens_ptr[i] << " ";
+            }
+            std::cout << "\n";
+            
+            std::cout << "subsequence_begins: ";
+            auto* subseq_ptr = subsequence_begins.data<int32_t>();
+            for (size_t i = 0; i < subsequence_begins.get_size(); ++i) {
+                std::cout << subseq_ptr[i] << " ";
+            }
+            std::cout << "\n";
+            
+            std::cout << "block_indices_begins: ";
+            auto* block_begins_ptr = block_indices_begins.data<int32_t>();
+            for (size_t i = 0; i < block_indices_begins.get_size(); ++i) {
+                std::cout << block_begins_ptr[i] << " ";
+            }
+            std::cout << "\n";
+            
+            // Print max_context_len scalar value
+            try {
+                auto max_ctx_tensor = m_request.get_tensor("max_context_len");
+                std::cout << "max_context_len: value=" << max_ctx_tensor.data<int32_t>()[0] << "\n";
+            } catch (...) {
+                std::cout << "max_context_len: <not accessible>\n";
+            }
+            
+            // Print sampled_tokens_indices
+            try {
+                auto sti_tensor = m_request.get_tensor("sampled_tokens_indices");
+                std::cout << "sampled_tokens_indices: shape=" << sti_tensor.get_shape() 
+                          << ", element_type=" << sti_tensor.get_element_type() << ", data: ";
+                // Print depending on element type
+                if (sti_tensor.get_element_type() == ov::element::i32) {
+                    auto* sti_ptr = sti_tensor.data<int32_t>();
+                    for (size_t i = 0; i < sti_tensor.get_size(); ++i) {
+                        std::cout << sti_ptr[i] << " ";
+                    }
+                } else if (sti_tensor.get_element_type() == ov::element::i64) {
+                    auto* sti_ptr = sti_tensor.data<int64_t>();
+                    for (size_t i = 0; i < sti_tensor.get_size(); ++i) {
+                        std::cout << sti_ptr[i] << " ";
+                    }
+                } else {
+                    std::cout << "<unknown type: " << sti_tensor.get_element_type() << ">";
+                }
+                std::cout << "\n";
+                std::cout << "  (gather_indices_values computed as: [";
+                for (size_t k = 0; k < gather_indices_values.size(); ++k) {
+                    std::cout << gather_indices_values[k];
+                    if (k + 1 < gather_indices_values.size()) std::cout << ", ";
+                }
+                std::cout << "])\n";
+            } catch (...) {
+                std::cout << "sampled_tokens_indices: <not accessible>\n";
+            }
+            
+            // Print block_indices tensor data
+            try {
+                auto block_indices_tensor = m_request.get_tensor("block_indices");
+                std::cout << "block_indices: shape=" << block_indices_tensor.get_shape() << ", data: ";
+                auto* block_idx_ptr = block_indices_tensor.data<int32_t>();
+                for (size_t i = 0; i < std::min<size_t>(10, block_indices_tensor.get_size()); ++i) {
+                    std::cout << block_idx_ptr[i] << " ";
+                }
+                std::cout << "\n";
+            } catch (...) {
+                std::cout << "block_indices: <not accessible>\n";
+            }
+            
+            std::cout << "======================================================\n\n";
+            
+            // Enable profiling to track operation execution
+            std::cout << "Enabling performance counters for operation-level debugging...\n";
+            auto compiled_model = m_request.get_compiled_model();
+            try {
+                // Try to enable profiling - may not work on all backends
+                compiled_model.set_property({{"PERF_COUNT", "YES"}});
+                std::cout << "Performance counters enabled.\n";
+            } catch (...) {
+                std::cout << "Could not enable performance counters (not supported on this device).\n";
+            }
+            
             static ManualTimer timer("pure generate inference");
             timer.start();
-            m_request.infer();
-            timer.end();
+            // Sentinel test: pre-fill logits with 42.0 to detect if OV writes to this tensor
+            try {
+                ov::Tensor logits_pre = m_request.get_tensor("logits");
+                if (logits_pre.get_size() > 0 && logits_pre.get_element_type() == ov::element::f32)
+                    std::fill(logits_pre.data<float>(), logits_pre.data<float>() + logits_pre.get_size(), 42.f);
+            } catch (...) {}
+            try {
+                m_request.infer();
+                timer.end();
+
+                // Print actual logits max/argmax for first 2 inference calls
+                {
+                    static int logits_print_count = 0;
+                    if (logits_print_count++ < 5) {
+                        try {
+                            ov::Tensor lt = m_request.get_tensor("logits");
+                            auto et = lt.get_element_type();
+                            auto get_f = [&](size_t i) -> float {
+                                if (et == ov::element::f32) return lt.data<const float>()[i];
+                                if (et == ov::element::f16) return static_cast<float>(lt.data<const ov::float16>()[i]);
+                                return 0.f;
+                            };
+                            float gmax = 0.f; size_t gmaxidx = 0;
+                            for (size_t i = 0; i < lt.get_size(); ++i) {
+                                float av = std::abs(get_f(i));
+                                if (av > gmax) { gmax = av; gmaxidx = i; }
+                            }
+                            auto shp = lt.get_shape();
+                            std::cout << "LOGITS shape=[";
+                            for (auto d : shp) std::cout << d << ",";
+                            std::cout << "] dtype=" << et.get_type_name()
+                                      << " global_max=" << gmax << "@" << gmaxidx;
+                            // Show raw first 6 to detect sentinel (42.0=never written, 0=written zero)
+                            std::cout << " first6[";
+                            for (size_t i = 0; i < std::min<size_t>(6, lt.get_size()); ++i)
+                                std::cout << get_f(i) << (i<5?",":"");
+                            std::cout << "]";
+                            if (shp.size() == 3) {
+                                size_t T = shp[1], V = shp[2];
+                                std::cout << " per_tok_max[";
+                                for (size_t t = 0; t < T; ++t) {
+                                    float tm = 0.f; size_t ta = 0;
+                                    for (size_t v = 0; v < V; ++v) {
+                                        float av = std::abs(get_f(t*V+v));
+                                        if (av > tm) { tm = av; ta = v; }
+                                    }
+                                    std::cout << "t" << t << ":" << tm << "@" << ta << " ";
+                                }
+                                std::cout << "]";
+                            }
+                            std::cout << (gmax == 0.f ? " <ZERO!\n" : " <OK\n");
+                        } catch (const std::exception& ex) {
+                            std::cout << "LOGITS: get_tensor failed: " << ex.what() << "\n";
+                        }
+
+                        // Cross-check: read output by index to detect name-mapping mismatch
+                        try {
+                            ov::Tensor lt_idx = m_request.get_output_tensor(0);
+                            auto et_i = lt_idx.get_element_type();
+                            float gmax_i = 0.f;
+                            size_t gtot = lt_idx.get_size();
+                            if (et_i == ov::element::f32) {
+                                const float* d = lt_idx.data<const float>();
+                                for (size_t i = 0; i < gtot; ++i)
+                                    if (std::abs(d[i]) > gmax_i) gmax_i = std::abs(d[i]);
+                            }
+                            std::cout << "LOGITS_by_idx(0): global_max=" << gmax_i
+                                      << (gmax_i == 0.f ? " <ZERO!\n" : " <OK\n");
+                        } catch (const std::exception& ex) {
+                            std::cout << "LOGITS_by_idx: failed: " << ex.what() << "\n";
+                        }
+
+                        // Read DEBUG_lm_input (lm_head activation = LayerNorm output pre-MatMul)
+                        // This tells us if zeros originate BEFORE or AT the lm_head MatMul.
+                        try {
+                            ov::Tensor di = m_request.get_tensor("DEBUG_lm_input");
+                            auto et2 = di.get_element_type();
+                            auto get_f2 = [&](size_t i) -> float {
+                                if (et2 == ov::element::f32) return di.data<const float>()[i];
+                                if (et2 == ov::element::f16) return static_cast<float>(di.data<const ov::float16>()[i]);
+                                return 0.f;
+                            };
+                            float gmax2 = 0.f;
+                            for (size_t i = 0; i < di.get_size(); ++i) {
+                                float av = std::abs(get_f2(i));
+                                if (av > gmax2) gmax2 = av;
+                            }
+                            auto shp2 = di.get_shape();
+                            std::cout << "DEBUG_lm_input shape=[";
+                            for (auto d : shp2) std::cout << d << ",";
+                            std::cout << "] dtype=" << et2.get_type_name()
+                                      << " global_max=" << gmax2;
+                            std::cout << " first6[";
+                            for (size_t i = 0; i < std::min<size_t>(6, di.get_size()); ++i)
+                                std::cout << get_f2(i) << (i<5?",":"");
+                            std::cout << "]"
+                                      << (gmax2 == 0.f ? " <ZERO! (zeros BEFORE MatMul)\n"
+                                                       : " <OK  (zeros AT MatMul)\n");
+                            // Per-position max to detect corrupted positions
+                            if (shp2.size() == 3) {
+                                size_t T2 = shp2[1], H2 = shp2[2];
+                                std::cout << "DEBUG_lm_input per_pos_max[";
+                                for (size_t t = 0; t < T2; ++t) {
+                                    float pm = 0.f; size_t pa = 0;
+                                    for (size_t h = 0; h < H2; ++h) {
+                                        float av = std::abs(get_f2(t * H2 + h));
+                                        if (av > pm) { pm = av; pa = h; }
+                                    }
+                                    std::cout << "pos" << t << ":max=" << pm << "@" << pa << " ";
+                                }
+                                std::cout << "]\n";
+                            }
+                        } catch (const std::exception& ex) {
+                            std::cout << "DEBUG_lm_input: not available: " << ex.what() << "\n";
+                        }
+                    }
+                }
+
+                
+            } catch (const std::exception& e) {
+                timer.end();
+                std::cout << "\n!!! INFERENCE FAILED WITH EXCEPTION !!!\n";
+                std::cout << "Exception type: " << typeid(e).name() << "\n";
+                std::cout << "Exception message: " << e.what() << "\n";
+                std::cout << "This error occurred during model inference.\n";
+                
+                // Try to get profiling info to see which operation was executing when it failed
+                try {
+                    auto profiling_info = m_request.get_profiling_info();
+                    if (!profiling_info.empty()) {
+                        std::cout << "\nOperations executed before failure (last 10):\n";
+                        size_t start_idx = profiling_info.size() > 10 ? profiling_info.size() - 10 : 0;
+                        for (size_t i = start_idx; i < profiling_info.size(); ++i) {
+                            const auto& info = profiling_info[i];
+                            std::cout << "  [" << i << "] " << info.node_name << " (" << info.node_type << ")\n";
+                        }
+                    }
+                } catch (...) {}
+                
+                throw;  // Re-throw to propagate the error
+            } catch (...) {
+                timer.end();
+                std::cout << "\n!!! INFERENCE FAILED WITH UNKNOWN EXCEPTION !!!\n";
+                std::cout << "An unknown exception occurred during model inference.\n";
+                throw;  // Re-throw to propagate the error
+            }
         }
 
         if (m_collect_attention_scores) {
@@ -605,7 +978,85 @@ public:
             }
         }
         // return logits
-        return m_request.get_tensor("logits");
+        std::cout << "=== ModelRunner::forward END ===\n";
+        
+        auto logits_tensor = m_request.get_tensor("logits");
+        std::cout << "DEBUG: Extracting logits tensor...\n";
+        std::cout << "  Logits shape: [";
+        for (size_t i = 0; i < logits_tensor.get_shape().size(); ++i) {
+            std::cout << logits_tensor.get_shape()[i];
+            if (i < logits_tensor.get_shape().size() - 1) std::cout << ", ";
+        }
+        std::cout << "]\n";
+        std::cout << "  Logits element type: " << logits_tensor.get_element_type() << "\n";
+        
+        if (logits_tensor.get_size() > 0) {
+            const float* logits_data = logits_tensor.data<const float>();
+            
+            if (logits_tensor.get_shape().size() == 3) {
+                size_t batch = logits_tensor.get_shape()[0];
+                size_t seq_len = logits_tensor.get_shape()[1];
+                size_t vocab_size = logits_tensor.get_shape()[2];
+                
+                // Check if ALL values are zero
+                bool all_zero = true;
+                for (size_t i = 0; i < logits_tensor.get_size() && all_zero; ++i) {
+                    if (logits_data[i] != 0.0f) all_zero = false;
+                }
+                std::cout << "  ALL values zero: " << (all_zero ? "YES" : "NO") << "\n";
+                
+                // Print max logit for EACH token position
+                for (size_t s = 0; s < seq_len; ++s) {
+                    const float* pos_logits = logits_data + s * vocab_size;
+                    auto max_it = std::max_element(pos_logits, pos_logits + vocab_size);
+                    size_t max_idx = max_it - pos_logits;
+                    float max_val = *max_it;
+                    // Check if this position is all zeros
+                    bool pos_all_zero = true;
+                    for (size_t v = 0; v < std::min<size_t>(100, vocab_size); ++v) {
+                        if (pos_logits[v] != 0.0f) { pos_all_zero = false; break; }
+                    }
+                    std::cout << "  Position[" << s << "]: argmax=" << max_idx 
+                              << ", max_logit=" << max_val
+                              << ", all_zero=" << (pos_all_zero ? "YES" : "NO")
+                              << ", first5=[" << pos_logits[0] << "," << pos_logits[1] << "," 
+                              << pos_logits[2] << "," << pos_logits[3] << "," << pos_logits[4] << "]\n";
+                }
+            }
+        }
+        
+        // Inspect cross-attention states (ReadValueWithSubgraph outputs)
+        {
+            auto& outputs = m_request.get_compiled_model().outputs();
+            std::cout << "  Model has " << outputs.size() << " outputs total\n";
+            bool found_nonzero_output = false;
+            for (const auto& out : outputs) {
+                const std::string& name = out.get_any_name();
+                // Skip logits, check everything else
+                if (name == "logits") continue;
+                try {
+                    auto t = m_request.get_tensor(name);
+                    if (t.get_size() > 0 && t.get_element_type() == ov::element::f32) {
+                        const float* d = t.data<const float>();
+                        bool has_nonzero = false;
+                        for (size_t i = 0; i < std::min<size_t>(50, t.get_size()); ++i) {
+                            if (d[i] != 0.0f) { has_nonzero = true; break; }
+                        }
+                        if (has_nonzero) {
+                            found_nonzero_output = true;
+                            std::cout << "  Output '" << name << "' shape=" << t.get_shape() 
+                                      << " has NON-ZERO values (first: " << d[0] << ")\n";
+                        }
+                    }
+                } catch (...) {}
+            }
+            if (!found_nonzero_output) {
+                std::cout << "  WARNING: All model outputs are zero!\n";
+            }
+        }
+        std::cout << "\n";
+        
+        return logits_tensor;
     }
 
     void append_embeddings(const std::vector<SequenceGroup::Ptr> & sequence_groups, const Scheduler::Output& scheduler_output) {
@@ -782,25 +1233,68 @@ private:
                                    const std::string& tensor_name,
                                    const ov::Shape& required_shape,
                                    ov::element::Type element_type) {
+       // Determine actual tensor name (it might differ from requested, e.g., decoder_input_ids vs input_ids)
+       std::string actual_tensor_name = tensor_name;
+       std::vector<std::string> names_to_try = {tensor_name};
+       if (tensor_name == "input_ids") {
+           names_to_try.push_back("decoder_input_ids");
+       }
+       
+       // Always find the actual tensor name in the model, even if cached
+       bool tensor_found = false;
+       for (const auto& name : names_to_try) {
+           try {
+               auto test_input = m_request.get_compiled_model().input(name);
+               actual_tensor_name = name;
+               tensor_found = true;
+               break;
+           } catch (const ov::Exception&) {
+               // Try next name
+           }
+       }
+       
        if (!cached_tensor) {
             // If cached tensor is not initialized, try to get the tensor from the m_request.
-            try {
-                cached_tensor = m_request.get_tensor(tensor_name);
-                std::cout << "Got tensor from request: " << tensor_name << "\n";
-            } catch (const ov::Exception&) {
+            if (tensor_found) {
+                try {
+                    cached_tensor = m_request.get_tensor(actual_tensor_name);
+                    std::cout << "Got tensor from request: " << actual_tensor_name << " (requested as " << tensor_name << ")\n";
+                } catch (const ov::Exception&) {
+                    std::cout << "Failed to get tensor " << actual_tensor_name << " from request\n";
+                    return ov::Tensor(element_type, required_shape);
+                }
+            } else {
                 // Fall back to default construction methods when exception occurs.
                 // For example, score_aggregation_window may not be used by a model but a Tensor is required for following operation.
                 std::cout << "Fall back initiated for tensor: " << tensor_name << "\n";
                 return ov::Tensor(element_type, required_shape);
             }
        }
-       if (cached_tensor.get_shape() != required_shape) {
+       
+       // Get the target tensor's partial shape to check its rank
+       ov::PartialShape target_shape;
+       try {
+           // Get the input info from the compiled model using the actual tensor name
+           target_shape = m_request.get_compiled_model().input(actual_tensor_name).get_partial_shape();
+           std::cout << "Parameter " << actual_tensor_name << " has shape: " << target_shape << "\n";
+       } catch (...) {
+           // If we can't get shape info, proceed with direct set_shape
+           target_shape = ov::PartialShape::dynamic();
+       }
+       
+       ov::Shape shape_to_set = required_shape;
+       
+       std::cout << "Setting shape for " << actual_tensor_name << ": required=" << required_shape 
+                 << ", target_expects=" << target_shape << ", shape_to_set=" << shape_to_set << "\n";
+       
+       if (cached_tensor.get_shape() != shape_to_set) {
             try {
-                cached_tensor.set_shape(required_shape);
+                cached_tensor.set_shape(shape_to_set);
             } catch (const ov::Exception& e) {
                 OPENVINO_THROW("set_shape failed for tensor: ", tensor_name, ". Error: ", e.what());
             }
         }
+        
         return cached_tensor;
     }
 
@@ -810,10 +1304,19 @@ private:
         const std::vector<SequenceGroup::Ptr>& sequence_groups,
         const Scheduler::Output& scheduler_output,
         const std::vector<std::map<size_t, std::vector<size_t>>>& seq_id_to_select_logical_idx_maps) {
+        std::cout << "\n--- _fill_indices_from_block_tables called ---\n";
+        std::cout << "Block tables in scheduler_output for sequences: ";
+        for (const auto& entry : scheduler_output.m_block_tables) {
+            std::cout << entry.first << " ";
+        }
+        std::cout << "\n";
+        std::cout << "seq_id_to_select_logical_idx_maps.size()=" << seq_id_to_select_logical_idx_maps.size() << "\n";
+        std::cout << "dst_tensor_names.size()=" << dst_tensor_names.size() << "\n";
         OPENVINO_ASSERT(seq_id_to_select_logical_idx_maps.size() == dst_tensor_names.size() ||
                         (dst_tensor_names.size() == 1 && !m_is_use_per_layer_cache_control) ||
                         seq_id_to_select_logical_idx_maps.empty());
         bool is_fill_all = seq_id_to_select_logical_idx_maps.empty();
+        std::cout << "is_fill_all=" << (is_fill_all ? "true" : "false") << "\n";
         size_t num_sequence_groups = scheduler_output.m_scheduled_sequence_groups_ids.size();
         std::vector<size_t> filled_blocks_per_layer(dst_tensor_names.size(), 0);
 
@@ -830,31 +1333,46 @@ private:
                 for (size_t i = 0; i < num_running_sequences; ++i) {
                     Sequence::CPtr sequence = running_sequences[i];
                     size_t seq_id = sequence->get_id();
+                    std::cout << "  Filling blocks for seq_id=" << seq_id << " (layer " << layer_idx << ")";
 
                     const auto& kv_blocks = scheduler_output.m_block_tables.at(seq_id);
+                    std::cout << " - found " << kv_blocks.size() << " layers in block table\n";
 
                     if (is_fill_all) {
+                        std::cout << "    Taking is_fill_all path\n";
                         size_t num_blocks = sequence_group->get_num_logical_blocks();
+                        std::cout << "    num_blocks=" << num_blocks << ", filling for layer " << layer_idx << "\n";
                         for (size_t block_id = 0; block_id < num_blocks; ++block_id) {
                             // In case no cache eviction is requested, all per-layer block tables are expected to be
                             // identical at all times
-                            block_indices_data[block_id] = kv_blocks[layer_idx][block_id]->get_index();
+                            int32_t physical_block_idx = kv_blocks[layer_idx][block_id]->get_index();
+                            std::cout << "      block_id=" << block_id << " -> physical_block_idx=" << physical_block_idx << "\n";
+                            block_indices_data[block_id] = physical_block_idx;
                         }
                         block_indices_data += num_blocks;
                         filled_blocks_per_layer[layer_idx] += num_blocks;
                     } else {
+                        std::cout << "    Taking selective fill path (NOT is_fill_all)\n";
                         auto seq_id_to_select_logical_idx_map = seq_id_to_select_logical_idx_maps[layer_idx];
+                        std::cout << "    seq_id_to_select_logical_idx_map.size()=" << seq_id_to_select_logical_idx_map.size() << "\n";
                         if (seq_id_to_select_logical_idx_map.find(seq_id) == seq_id_to_select_logical_idx_map.end()) {
+                            std::cout << "    seq_id " << seq_id << " NOT found in map for layer " << layer_idx << ", skipping\n";
                             continue;  // sequence not being present in layer-specific map means it should be skipped entirely
                         }
 
+                        std::cout << "    seq_id " << seq_id << " found in map\n";
                         const auto& select_logical_idxs = seq_id_to_select_logical_idx_maps[layer_idx].at(seq_id);
+                        std::cout << "    select_logical_idxs.size()=" << select_logical_idxs.size() << "\n";
                         const auto& block_table = kv_blocks[layer_idx];
                         size_t block_table_size = block_table.size();
+                        std::cout << "    block_table_size=" << block_table_size << "\n";
                         for (size_t block_id = 0; block_id < select_logical_idxs.size(); ++block_id) {
                             size_t logical_block_idx = select_logical_idxs[block_id];
                             OPENVINO_ASSERT(logical_block_idx < block_table_size);
-                            block_indices_data[block_id] = block_table[logical_block_idx]->get_index();
+                            int32_t physical_block_idx = block_table[logical_block_idx]->get_index();
+                            std::cout << "      block_id=" << block_id << ", logical_block_idx=" << logical_block_idx 
+                                      << " -> physical_block_idx=" << physical_block_idx << "\n";
+                            block_indices_data[block_id] = physical_block_idx;
                         }
                         block_indices_data += select_logical_idxs.size();
                         filled_blocks_per_layer[layer_idx] += select_logical_idxs.size();
@@ -862,10 +1380,23 @@ private:
                 }
             }
         }
+        std::cout << "\n--- Verification after filling ---\n";
         for (size_t layer_idx = 0; layer_idx < dst_tensor_names.size(); layer_idx++) {
             const auto& target_tensor_name = dst_tensor_names[layer_idx];
             size_t tensor_size = m_request.get_tensor(target_tensor_name).get_size();
             size_t last_filled_element_idx = filled_blocks_per_layer[layer_idx];
+            std::cout << "  " << target_tensor_name << " tensor_size=" << tensor_size 
+                      << ", filled=" << last_filled_element_idx << "\n";
+            
+            // Print the actual values in the tensor
+            auto tensor = m_request.get_tensor(target_tensor_name);
+            auto* data = tensor.data<int32_t>();
+            std::cout << "  " << target_tensor_name << " actual data: ";
+            for (size_t i = 0; i < std::min<size_t>(10, tensor_size); ++i) {
+                std::cout << data[i] << " ";
+            }
+            std::cout << "\n";
+            
             OPENVINO_ASSERT(tensor_size == last_filled_element_idx, "did not fill tensor ", target_tensor_name, " completely, tensor size in elements ", tensor_size, ", last filled idx ", last_filled_element_idx);
         }
     }
@@ -912,6 +1443,8 @@ private:
                             const Scheduler::Output& scheduler_output,
                             size_t total_num_blocks,
                             const std::map<size_t, std::set<size_t>>& seq_id_to_skipped_blocks_map) {
+        std::cout << "\n--- _set_block_indices called ---\n";
+        std::cout << "Total num blocks requested: " << total_num_blocks << "\n";
         std::vector<std::string> tensor_names = {"block_indices"};
 
         size_t num_layers = 1;
@@ -926,7 +1459,8 @@ private:
 
         std::vector<size_t> num_blocks_per_layer(num_layers);
 
-        std::vector<std::map<size_t, std::vector<size_t>>> seq_id_to_select_logical_idx_map(m_num_decoder_layers);
+        // Create map with correct size based on num_layers, not m_num_decoder_layers
+        std::vector<std::map<size_t, std::vector<size_t>>> seq_id_to_select_logical_idx_map(num_layers);
         size_t num_sequence_groups = scheduler_output.m_scheduled_sequence_groups_ids.size();
         for (size_t layer_idx = 0; layer_idx < num_layers; layer_idx++) {
             for (size_t i = 0; i < num_sequence_groups; ++i) {
@@ -938,8 +1472,11 @@ private:
                     Sequence::CPtr sequence = running_sequences[k];
                     size_t num_blocks = sequence_group->get_num_logical_blocks();
                     size_t seq_id = sequence->get_id();
+                    std::cout << "  Processing sequence: seq_id=" << seq_id << ", num_blocks=" << num_blocks << "\n";
+                    std::cout << "    layer_idx=" << layer_idx << ", num_blocks_per_layer[" << layer_idx << "] BEFORE=" << num_blocks_per_layer[layer_idx] << "\n";
                     std::vector<size_t> remaining_logical_block_ids;
                     if (seq_id_to_skipped_blocks_map.find(seq_id) != seq_id_to_skipped_blocks_map.end()) {
+                        std::cout << "    Taking SKIPPED BLOCKS path\n";
                         const auto& skip_set = seq_id_to_skipped_blocks_map.at(seq_id);
                         OPENVINO_ASSERT(num_blocks >= skip_set.size());
                         remaining_logical_block_ids.reserve(num_blocks - skip_set.size());
@@ -950,21 +1487,29 @@ private:
                         }
                         seq_id_to_select_logical_idx_map[layer_idx][seq_id] = remaining_logical_block_ids;
                         num_blocks_per_layer[layer_idx] += remaining_logical_block_ids.size();
+                        std::cout << "    Added " << remaining_logical_block_ids.size() << " blocks\n";
                     }
                     else
                     {
+                        std::cout << "    Taking NORMAL (no skipped blocks) path\n";
                         auto& vec = seq_id_to_select_logical_idx_map[layer_idx][seq_id];
                         vec.resize(num_blocks);
                         std::iota(vec.begin(), vec.end(), 0);
                         num_blocks_per_layer[layer_idx] += num_blocks;
+                        std::cout << "    Added " << num_blocks << " blocks\n";
                     }
+                    std::cout << "    num_blocks_per_layer[" << layer_idx << "] AFTER=" << num_blocks_per_layer[layer_idx] << "\n";
                 }
 
             }
         }
 
+        std::cout << "\n--- Setting block_indices tensor shapes ---\n";
         for (size_t i = 0; i < num_layers; i++) {
+            std::cout << "  Setting " << tensor_names[i] << " shape to [" << num_blocks_per_layer[i] << "]\n";
             m_request.get_tensor(tensor_names[i]).set_shape({num_blocks_per_layer[i]});
+            auto actual_shape = m_request.get_tensor(tensor_names[i]).get_shape();
+            std::cout << "  " << tensor_names[i] << " actual shape after set_shape: [" << actual_shape[0] << "]\n";
         }
 
         _fill_indices_from_block_tables(tensor_names, sequence_groups, scheduler_output, seq_id_to_select_logical_idx_map);

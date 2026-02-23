@@ -4,6 +4,7 @@
 #include "audio_utils.hpp"
 #include "openvino/genai/whisper_pipeline.hpp"
 #include "openvino/genai/continuous_batching_pipeline.hpp"
+#include "openvino/genai/generation_handle.hpp"
 #include "openvino/openvino.hpp"
 #include "openvino/pass/sdpa_to_paged_attention.hpp"
 #include "openvino/pass/stateful_to_stateless.hpp"
@@ -181,9 +182,34 @@ int main(int argc, char* argv[]) try {
     }
     raw_speech = std::move(extended_raw_speech);
 
+
+    /* FULL SDPA CB TEST
     auto result = pipeline.generate(raw_speech, config);
     std::cout << "Result from standard pipeline implementation: " << result << "\n";
 
+    std::cout << "Pipelines warmup...\n";
+    ov::genai::WhisperPipelinePoc poc_pipeline_cb(models_path, device);
+    poc_pipeline_cb.experimental_generate_with_continuous_batching(raw_speech, config);
+    ov::genai::WhisperPipelinePoc poc_pipeline_static_batch(models_path, device);
+    poc_pipeline_static_batch.generate(raw_speech, true, config);
+
+    std::cout << "Pipelines warmup completed. Running timed generations in preferential scenario...\n";
+     std::cout << "Checking experimental continuous batching pipeline...\n";
+    auto start_cb = std::chrono::high_resolution_clock::now();
+    poc_pipeline_cb.experimental_generate_with_continuous_batching(raw_speech, config);
+    auto end_cb = std::chrono::high_resolution_clock::now();
+    auto duration_cb = std::chrono::duration_cast<std::chrono::milliseconds>(end_cb - start_cb);
+    std::cout << "POC pipeline experimental continuous batching mode check over. Checking static batching pipeline...\n";
+    auto start_static = std::chrono::high_resolution_clock::now();
+    poc_pipeline_static_batch.generate(raw_speech, true, config);
+    auto end_static = std::chrono::high_resolution_clock::now();
+    auto duration_static = std::chrono::duration_cast<std::chrono::milliseconds>(end_static - start_static);
+    std::cout << "POC pipeline experimental continuous batching mode execution time: " << duration_cb.count() / 1000.0 << " seconds\n";
+    std::cout << "POC pipeline static batching mode execution time: " << duration_static.count() / 1000.0 << " seconds\n";
+
+    */
+
+    /* Static version 
     std::cout << "Loading pipelines\n";
     bool batched_mode = true;
     ov::genai::WhisperPipelinePoc poc_pipeline_seq(models_path, device);
@@ -204,7 +230,7 @@ int main(int argc, char* argv[]) try {
     auto end_batched = std::chrono::high_resolution_clock::now();
     auto duration_batched = std::chrono::duration_cast<std::chrono::milliseconds>(end_batched - start_batched);
     std::cout << "POC pipeline batched mode execution time: " << duration_batched.count() / 1000.0 << " seconds\n";
-
+    */
 
     /* Baseline flow test
     std::cout << "Checking baseline pipeline...\n";
@@ -221,15 +247,20 @@ int main(int argc, char* argv[]) try {
     //    std::cout << "timestamps: [" << chunk.start_ts << ", " << chunk.end_ts << "] text: " << chunk.text << "\n";
     //}
 
-    /*
-    // CB flow test
+
+// CB flow test
     std::cout << "Creating ContinuousBatchingPipeline...\n";
   //  ov::AnyMap properties{{"KV_CACHE_PRECISION", "U8"}};
+    // Force single-token scheduling: avoids the PA multi-query prefill kernel producing
+    // wrong attention outputs at the last position of a batched prefix (M>1 AMX BF16 bug).
+    // With max_num_batched_tokens=1 each prefix token is processed separately (M=1 path),
+    // which is confirmed correct. Decode steps are already M=1 so there is no extra cost.
+    ov::genai::SchedulerConfig sched_config;
+    sched_config.max_num_batched_tokens = 1;
     auto pipe = ov::genai::ContinuousBatchingPipeline(
-        models_path,
-        ov::genai::SchedulerConfig{},
-        "CPU",
-        properties
+        models_path.parent_path() / (models_path.filename().string() + "-stateful"),
+        sched_config,
+        "CPU"
     );
     std::cout << "ContinuousBatchingPipeline created. Adding request\n";
 
@@ -237,7 +268,12 @@ int main(int argc, char* argv[]) try {
 
     std::cout << "Processing requests...\n";
 
-    for (int i = 0; i < 1; ++i) {
+    // With max_num_batched_tokens=1 the N-token prefix occupies N step() calls before
+    // any token is generated (return_timestamps=false: 4 prefix tokens -> 4 prefill steps).
+    // Budget: prefix_len (up to 5) + desired generated tokens (10) = 15 steps.
+    const int max_steps = 15;
+    const int max_tokens_to_read = 10;
+    for (int i = 0; i < max_steps; ++i) {
         std::cout << "Step " << i + 1 << "\n";
         pipe.step();
         if (!pipe.has_non_finished_requests()) {
@@ -245,15 +281,36 @@ int main(int argc, char* argv[]) try {
         }
     }
 
-    std::cout << "Reading outputs...\n";
-    auto outputs = handle->read_all();
-    std::vector<int64_t> generated_ids = outputs[0].generated_ids;
+    std::cout << "Reading outputs token by token...\n";
+    std::vector<int64_t> all_tokens;
+    int tokens_read = 0;
+    
+    while (tokens_read < max_tokens_to_read && handle->can_read()) {
+        std::unordered_map<uint64_t, ov::genai::GenerationOutput> iteration_results = handle->read();
+        for (const auto& [request_id, output] : iteration_results) {
+            for (const auto& token : output.generated_ids) {
+                all_tokens.push_back(token);
+                tokens_read++;
+                std::cout << "Token " << tokens_read << ": " << token << "\n";
+                if (tokens_read >= max_tokens_to_read) {
+                    break;
+                }
+            }
+            if (tokens_read >= max_tokens_to_read) {
+                break;
+            }
+        }
+    }
+    
+    //auto outputs = handle->read_all();
+    //std::vector<int64_t> generated_ids = outputs[0].generated_ids;
     std::cout << "Generated token IDs: ";
-    for (const auto& id : generated_ids) {
+    for (const auto& id : all_tokens) {
         std::cout << id << " ";
     }
     std::cout << "\n";
-    */
+
+    std::cout << "Decoded text: " << pipe.get_tokenizer().decode(all_tokens) << "\n";
     // GenAI embedded test end
 
 } catch (const std::exception& error) {
