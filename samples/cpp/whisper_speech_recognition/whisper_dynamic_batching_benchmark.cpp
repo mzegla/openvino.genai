@@ -3,8 +3,11 @@
 
 #include "audio_utils.hpp"
 #include "openvino/genai/whisper_pipeline.hpp"
+#include "openvino/genai/continuous_batching_pipeline.hpp"
+#include "openvino/genai/generation_handle.hpp"
 #include "openvino/genai/tokenizer.hpp"
 #include <iostream>
+#include <regex>
 #include <chrono>
 #include <thread>
 #include <queue>
@@ -14,6 +17,9 @@
 #include <algorithm>
 #include <numeric>
 #include <iomanip>
+#include <filesystem>
+#include <unistd.h>
+#include <fcntl.h>
 
 struct RequestMetrics {
     size_t request_id;
@@ -33,13 +39,6 @@ struct PendingRequest {
     std::chrono::steady_clock::time_point arrival_time;
 };
 
-struct InFlightRequest {
-    size_t request_id;
-    std::chrono::steady_clock::time_point arrival_time;
-    std::chrono::steady_clock::time_point submission_time;
-    std::future<std::vector<int64_t>> result_future;
-};
-
 class DynamicBenchmark {
 private:
     std::string model_path;
@@ -48,17 +47,13 @@ private:
     ov::genai::WhisperGenerationConfig config;
     bool is_native_mode;
     ov::genai::Tokenizer tokenizer;
-    
+    ov::genai::PipelineMetrics cb_final_metrics;  // captured at end of process_requests_cb
+
     std::queue<PendingRequest> request_queue;
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
     
-    std::queue<InFlightRequest> inflight_queue;
-    std::mutex inflight_mutex;
-    std::condition_variable inflight_cv;
-    
     std::atomic<bool> stop_flag{false};
-    std::atomic<bool> submitter_finished{false};
     std::atomic<size_t> next_request_id{0};
     std::atomic<size_t> scheduled_requests{0};
     std::atomic<size_t> completed_requests{0};
@@ -78,9 +73,6 @@ public:
         auto start_time = std::chrono::steady_clock::now();
         double inter_arrival_time_ms = 1000.0 / request_rate;  // Time between requests in milliseconds
         
-        std::cout << "Request generator started: " << request_rate << " req/s, duration: " 
-                  << duration_seconds << "s, inter-arrival: " << inter_arrival_time_ms << "ms\n";
-        
         auto next_request_time = start_time;
         
         while (true) {
@@ -88,7 +80,6 @@ public:
             auto elapsed = std::chrono::duration<double>(now - start_time).count();
             
             if (elapsed >= duration_seconds) {
-                std::cout << "Request generation completed. Total scheduled: " << scheduled_requests.load() << "\n";
                 break;
             }
             
@@ -118,45 +109,12 @@ public:
         queue_cv.notify_all();
     }
     
-    void request_processor() {
-        std::cout << "Request processor started (" 
-                  << (is_native_mode ? "NATIVE sequential mode" : "CONTINUOUS BATCHING mode") 
-                  << ")\n";
-        
-        // Create pipeline based on mode
-        std::unique_ptr<ov::genai::WhisperPipeline> native_pipeline;
-        std::unique_ptr<ov::genai::WhisperPipelinePoc> cb_pipeline;
-        
+    void request_processor(std::unique_ptr<ov::genai::WhisperPipeline> native_pipeline,
+                            std::unique_ptr<ov::genai::ContinuousBatchingPipeline> cb_pipe) {
         if (is_native_mode) {
-            native_pipeline = std::make_unique<ov::genai::WhisperPipeline>(model_path + "-stateful", device);
-            std::cout << "Warming up native pipeline...\n";
-            native_pipeline->generate(base_audio, config);
-            std::cout << "Warmup completed\n";
-            
-            // Native mode: sequential processing
             process_requests_sequential(native_pipeline.get());
-            
         } else {
-            cb_pipeline = std::make_unique<ov::genai::WhisperPipelinePoc>(model_path, device);
-            std::cout << "Warming up continuous batching pipeline...\n";
-            cb_pipeline->experimental_generate_with_continuous_batching(base_audio, config);
-            
-            // Start async continuous batching mode
-            std::cout << "Starting async continuous batching...\n";
-            cb_pipeline->start_continuous_batching(32);
-            std::cout << "Warmup completed\n";
-            
-            // Continuous batching mode: async submission + result collection
-            // Both run in separate threads for true async operation
-            std::thread submitter(&DynamicBenchmark::submit_requests_async, this, cb_pipeline.get());
-            std::thread result_collector(&DynamicBenchmark::collect_results, this);
-            
-            submitter.join();
-            result_collector.join();
-            
-            // Cleanup
-            std::cout << "Stopping continuous batching...\n";
-            cb_pipeline->stop_continuous_batching();
+            process_requests_cb(std::move(cb_pipe));
         }
     }
     
@@ -173,7 +131,6 @@ public:
                 });
                 
                 if (request_queue.empty() && stop_flag.load()) {
-                    std::cout << "Sequential processor exiting, no more requests\n";
                     break;
                 }
                 
@@ -217,166 +174,122 @@ public:
                 
                 completed_requests++;
                 
-                if (completed_requests % 10 == 0) {
-                    std::cout << "Completed: " << completed_requests.load() 
-                              << " / " << scheduled_requests.load() 
-                              << " (latency: " << std::fixed << std::setprecision(1) 
-                              << metrics_entry.total_latency_ms << " ms)\n";
-                }
-                
             } catch (const std::exception& e) {
                 std::cerr << "Error processing request " << req.request_id << ": " << e.what() << "\n";
             }
         }
     }
     
-    // Continuous batching mode: submit requests without blocking
-    void submit_requests_async(ov::genai::WhisperPipelinePoc* pipeline) {
-        std::cout << "Async request submitter started\n";
-        
-        while (true) {
-            PendingRequest req;
-            
-            // Get next request from queue
-            {
-                std::unique_lock<std::mutex> lock(queue_mutex);
-                queue_cv.wait(lock, [this] { 
-                    return !request_queue.empty() || stop_flag.load(); 
-                });
-                
-                if (request_queue.empty() && stop_flag.load()) {
-                    std::cout << "Request submitter exiting, no more requests\n";
-                    break;
-                }
-                
-                if (request_queue.empty()) {
-                    continue;
-                }
-                
-                req = request_queue.front();
-                request_queue.pop();
-            }
-            
-            // Submit request (NON-BLOCKING)
-            auto submission_time = std::chrono::steady_clock::now();
-            
-            std::cout << "[Submitter] Request " << req.request_id << " - starting generate_async()\n";
-            
-            try {
-                auto future = pipeline->generate_async(req.audio, config);
-                
-                auto after_submission = std::chrono::steady_clock::now();
-                auto submission_duration_ms = std::chrono::duration<double, std::milli>(
-                    after_submission - submission_time).count();
-                
-                std::cout << "[Submitter] Request " << req.request_id 
-                          << " - generate_async() returned (took " << std::fixed << std::setprecision(1)
-                          << submission_duration_ms << " ms)\n";
-                
-                // Add to in-flight queue for result collection
-                InFlightRequest inflight;
-                inflight.request_id = req.request_id;
-                inflight.arrival_time = req.arrival_time;
-                inflight.submission_time = submission_time;
-                inflight.result_future = std::move(future);
-                
-                {
-                    std::lock_guard<std::mutex> lock(inflight_mutex);
-                    inflight_queue.push(std::move(inflight));
-                    std::cout << "[Submitter] Request " << req.request_id 
-                              << " - added to inflight queue (queue size: " << inflight_queue.size() << ")\n";
-                }
-                inflight_cv.notify_one();
-                
-            } catch (const std::exception& e) {
-                std::cerr << "Error submitting request " << req.request_id << ": " << e.what() << "\n";
-            }
+    // Called from run() before the generator starts — builds and warms up the CB pipeline.
+    std::unique_ptr<ov::genai::ContinuousBatchingPipeline> setup_cb_pipeline() {
+        ov::AnyMap pipe_properties{{ov::hint::kv_cache_precision.name(), ov::element::bf16}};
+        ov::genai::SchedulerConfig sched_cfg;
+        sched_cfg.max_num_batched_tokens = 100;
+        sched_cfg.max_num_tokens_per_prefill_step = 1;
+        auto cb_pipe = std::make_unique<ov::genai::ContinuousBatchingPipeline>(
+            std::filesystem::path(model_path + "-stateful"),
+            sched_cfg, device, pipe_properties);
+        {
+            auto warmup_cfg = static_cast<ov::genai::WhisperGenerationConfig>(config);
+            auto warmup_handle = cb_pipe->add_request(static_cast<uint64_t>(0xFFFFFFFFFFFFFFFFull), base_audio, warmup_cfg);
+            while (cb_pipe->has_non_finished_requests())
+                cb_pipe->step();
         }
-        
-        // Signal that submitter has finished
-        std::cout << "Request submitter finished all submissions\n";
-        submitter_finished = true;
-        inflight_cv.notify_all();
+        return cb_pipe;
     }
-    
-    // Continuous batching mode: collect results from futures
-    void collect_results() {
-        std::cout << "Result collector started\n";
-        size_t expected_requests = 0;
-        
+
+    // Continuous batching mode: single-threaded step loop using ContinuousBatchingPipeline
+    void process_requests_cb(std::unique_ptr<ov::genai::ContinuousBatchingPipeline> cb_pipe) {
+
+        // Per-request tracking
+        struct ActiveRequest {
+            size_t request_id;
+            std::chrono::steady_clock::time_point arrival_time;
+            std::chrono::steady_clock::time_point start_time;
+            ov::genai::GenerationHandle handle;
+            std::vector<int64_t> tokens;
+        };
+        std::vector<ActiveRequest> active;
+
+        auto ingest_queue = [&]() {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            while (!request_queue.empty()) {
+                auto req = request_queue.front();
+                request_queue.pop();
+                auto start_time = std::chrono::steady_clock::now();
+                auto req_cfg = static_cast<ov::genai::WhisperGenerationConfig>(config);
+                auto handle = cb_pipe->add_request(
+                    static_cast<uint64_t>(req.request_id), req.audio, req_cfg);
+                ActiveRequest ar;
+                ar.request_id  = req.request_id;
+                ar.arrival_time = req.arrival_time;
+                ar.start_time   = start_time;
+                ar.handle       = std::move(handle);
+                active.push_back(std::move(ar));
+                std::cout << "[+] Request #" << req.request_id << " added  (active: " << active.size() << ")\n";
+            }
+        };
+
+        auto collect_finished = [&]() {
+            for (auto it = active.begin(); it != active.end(); ) {
+                while (it->handle->can_read()) {
+                    auto outputs = it->handle->read();
+                    for (auto& [seq_id, output] : outputs)
+                        it->tokens.insert(it->tokens.end(),
+                            output.generated_ids.begin(), output.generated_ids.end());
+                }
+                if (it->handle->get_status() == ov::genai::GenerationStatus::FINISHED) {
+                    auto completion_time = std::chrono::steady_clock::now();
+                    RequestMetrics m;
+                    m.request_id         = it->request_id;
+                    m.arrival_time       = it->arrival_time;
+                    m.start_time         = it->start_time;
+                    m.completion_time    = completion_time;
+                    m.queue_time_ms      = std::chrono::duration<double, std::milli>(
+                                               it->start_time - it->arrival_time).count();
+                    m.processing_time_ms = std::chrono::duration<double, std::milli>(
+                                               completion_time - it->start_time).count();
+                    m.total_latency_ms   = std::chrono::duration<double, std::milli>(
+                                               completion_time - it->arrival_time).count();
+                    m.tokens = std::move(it->tokens);
+                    {
+                        std::lock_guard<std::mutex> lock(metrics_mutex);
+                        metrics.push_back(std::move(m));
+                    }
+                    completed_requests++;
+                    it = active.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        };
+
+        // Main step loop: ingest new requests, step, collect
         while (true) {
-            InFlightRequest inflight;
-            
-            // Get next in-flight request
-            {
-                std::unique_lock<std::mutex> lock(inflight_mutex);
-                inflight_cv.wait(lock, [this] { 
-                    return !inflight_queue.empty() || submitter_finished.load(); 
-                });
-                
-                // Check if we're done: submitter finished AND no more in-flight requests
-                if (inflight_queue.empty() && submitter_finished.load()) {
-                    std::cout << "Result collector exiting: all requests completed\n";
-                    break;
-                }
-                
-                if (inflight_queue.empty()) {
-                    continue;
-                }
-                
-                inflight = std::move(inflight_queue.front());
-                inflight_queue.pop();
+            ingest_queue();
+
+            if (active.empty()) {
+                if (stop_flag.load()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
             }
-            
-            std::cout << "[Collector] Request " << inflight.request_id << " - waiting for result...\n";
-            
-            // Wait for result (THIS is where blocking happens, but queue can fill meanwhile)
-            try {
-                auto tokens = inflight.result_future.get();
-                
-                auto completion_time = std::chrono::steady_clock::now();
-                
-                // Record metrics
-                RequestMetrics metrics_entry;
-                metrics_entry.request_id = inflight.request_id;
-                metrics_entry.arrival_time = inflight.arrival_time;
-                metrics_entry.start_time = inflight.submission_time;  // Approximation
-                metrics_entry.completion_time = completion_time;
-                
-                metrics_entry.queue_time_ms = std::chrono::duration<double, std::milli>(
-                    inflight.submission_time - inflight.arrival_time).count();
-                metrics_entry.processing_time_ms = std::chrono::duration<double, std::milli>(
-                    completion_time - inflight.submission_time).count();
-                metrics_entry.total_latency_ms = std::chrono::duration<double, std::milli>(
-                    completion_time - inflight.arrival_time).count();
-                
-                // Store tokens for validation in continuous batching mode
-                metrics_entry.tokens = tokens;
-                
-                {
-                    std::lock_guard<std::mutex> lock(metrics_mutex);
-                    metrics.push_back(metrics_entry);
-                }
-                
-                completed_requests++;
-                
-                if (completed_requests % 10 == 0) {
-                    std::cout << "Completed: " << completed_requests.load() 
-                              << " / " << scheduled_requests.load() 
-                              << " (latency: " << std::fixed << std::setprecision(1) 
-                              << metrics_entry.total_latency_ms << " ms)\n";
-                }
-                
-            } catch (const std::exception& e) {
-                std::cerr << "Error collecting result for request " << inflight.request_id 
-                          << ": " << e.what() << "\n";
-            }
+
+            std::cout << "[Step] Active: " << active.size() << " request(s)\n";
+            cb_pipe->step();
+            collect_finished();
         }
+
+        // Flush any requests that arrived right as stop_flag was raised
+        ingest_queue();
+        while (!active.empty()) {
+            std::cout << "[Step] Active: " << active.size() << " request(s)\n";
+            cb_pipe->step();
+            collect_finished();
+        }
+        cb_final_metrics = cb_pipe->get_metrics();
     }
     
     void run(double request_rate, double duration_seconds) {
-        auto start_time = std::chrono::steady_clock::now();
-        
         std::cout << "\n========================================\n";
         std::cout << "Dynamic Batching Benchmark\n";
         std::cout << "Mode: " << (is_native_mode ? "NATIVE (sequential)" : "CONTINUOUS BATCHING") << "\n";
@@ -385,15 +298,28 @@ public:
         std::cout << "Duration: " << duration_seconds << " s\n";
         std::cout << "Expected requests: " << static_cast<int>(request_rate * duration_seconds) << "\n";
         std::cout << "========================================\n\n";
-        
-        // Start processor thread
-        std::thread processor_thread(&DynamicBenchmark::request_processor, this);
-        
+
+        // Build and warm up the pipeline BEFORE the generator starts so that
+        // no requests pile up in the queue during model loading / warmup.
+        std::unique_ptr<ov::genai::WhisperPipeline>            native_pipeline;
+        std::unique_ptr<ov::genai::ContinuousBatchingPipeline> cb_pipe;
+        if (is_native_mode) {
+            native_pipeline = std::make_unique<ov::genai::WhisperPipeline>(model_path + "-stateful", device);
+            native_pipeline->generate(base_audio, config);
+        } else {
+            cb_pipe = setup_cb_pipeline();
+        }
+
+        auto start_time = std::chrono::steady_clock::now();
+
+        // Start processor thread (pipeline already warm)
+        std::thread processor_thread(&DynamicBenchmark::request_processor, this,
+                                     std::move(native_pipeline), std::move(cb_pipe));
+
         // Run generator in main thread
         request_generator(request_rate, duration_seconds);
-        
+
         // Wait for all requests to complete
-        std::cout << "\nWaiting for pending requests to complete...\n";
         processor_thread.join();
         
         auto end_time = std::chrono::steady_clock::now();
@@ -402,10 +328,63 @@ public:
         // Print summary
         print_summary(total_duration);
     }
-    
+
+    // Burst mode: all N requests are injected at once before processing begins.
+    // For CB this gives the maximum possible batch size from the first step;
+    // for native it simply queues everything and processes sequentially.
+    void run_burst(size_t n_requests) {
+        std::cout << "\n========================================\n";
+        std::cout << "Dynamic Batching Benchmark\n";
+        std::cout << "Mode: " << (is_native_mode ? "NATIVE (sequential)" : "CONTINUOUS BATCHING") << "\n";
+        std::cout << "BURST: " << n_requests << " requests, all added simultaneously\n";
+        std::cout << "========================================\n\n";
+
+        std::unique_ptr<ov::genai::WhisperPipeline>            native_pipeline;
+        std::unique_ptr<ov::genai::ContinuousBatchingPipeline> cb_pipe;
+        if (is_native_mode) {
+            native_pipeline = std::make_unique<ov::genai::WhisperPipeline>(model_path + "-stateful", device);
+            native_pipeline->generate(base_audio, config);
+        } else {
+            cb_pipe = setup_cb_pipeline();
+        }
+
+        // Enqueue all requests at time zero before starting the processor.
+        auto burst_time = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < n_requests; ++i) {
+            PendingRequest req;
+            req.request_id  = next_request_id++;
+            req.audio       = base_audio;
+            req.arrival_time = burst_time;
+            request_queue.push(req);
+            scheduled_requests++;
+        }
+        // Signal that no further requests will arrive.
+        stop_flag = true;
+
+        auto start_time = std::chrono::steady_clock::now();
+
+        std::thread processor_thread(&DynamicBenchmark::request_processor, this,
+                                     std::move(native_pipeline), std::move(cb_pipe));
+        // Unblock the queue_cv wait in the sequential processor.
+        queue_cv.notify_all();
+        processor_thread.join();
+
+        auto end_time = std::chrono::steady_clock::now();
+        double total_duration = std::chrono::duration<double>(end_time - start_time).count();
+
+        print_summary(total_duration);
+    }
+
     void print_summary(double total_duration_seconds) {
         std::lock_guard<std::mutex> lock(metrics_mutex);
-        
+
+        // Strip Whisper timestamp tokens (<|N.NN|>) from a decoded string so that
+        // BF16 rounding shifts in timestamp values don't count as text mismatches.
+        auto strip_timestamps = [](const std::string& s) -> std::string {
+            static const std::regex re("<\\|[0-9]+(?:\\.[0-9]+)?\\|>");
+            return std::regex_replace(s, re, "");
+        };
+
         if (metrics.empty()) {
             std::cout << "\nNo requests completed!\n";
             return;
@@ -437,7 +416,145 @@ public:
         double avg_processing = std::accumulate(processing_times.begin(), processing_times.end(), 0.0) / processing_times.size();
         
         double throughput = metrics.size() / total_duration_seconds;
-        
+
+        // Correctness validation first — tokenizer.decode() emits [OV-DBG] lines to
+        // stdout, so run this section before printing the summary numbers so the
+        // stats always appear at the bottom of the output.
+        std::cout << "\n--- Correctness Validation ---\n";
+        if (!metrics.empty()) {
+            size_t correct_count = 0;
+            size_t mismatches = 0;
+            
+            // Check if we're in native mode (text) or CB mode (tokens)
+            bool is_text_mode = !metrics[0].text.empty();
+            bool is_token_mode = !metrics[0].tokens.empty();
+            
+            if (is_text_mode) {
+                // Native mode: compare text
+                const auto& reference_text = metrics[0].text;
+                const std::string reference_text_stripped = strip_timestamps(reference_text);
+                std::cout << "Mode: Native (text comparison)\n";
+                std::cout << "Reference text (request 0): \"" << reference_text << "\"\n";
+                std::cout << "Reference text (stripped):  \"" << reference_text_stripped << "\"\n\n";
+
+                size_t text_match_count = 0;
+                for (const auto& m : metrics) {
+                    if (m.text == reference_text) {
+                        correct_count++;
+                    } else {
+                        mismatches++;
+                        if (mismatches <= 5) {
+                            std::cout << "  Mismatch in request " << m.request_id
+                                      << ": got \"" << m.text.substr(0, 60)
+                                      << (m.text.size() > 60 ? "..." : "") << "\"\n";
+                        }
+                    }
+                    if (strip_timestamps(m.text) == reference_text_stripped)
+                        text_match_count++;
+                }
+
+                double exact_rate = 100.0 * correct_count / metrics.size();
+                double text_rate  = 100.0 * text_match_count  / metrics.size();
+                std::cout << "\nExact match:  " << correct_count    << " / " << metrics.size()
+                          << " (" << exact_rate << "%)\n";
+                std::cout << "Text match:   " << text_match_count  << " / " << metrics.size()
+                          << " (" << text_rate  << "%)  [timestamps stripped]\n";
+
+                if (exact_rate == 100.0) {
+                    std::cout << "✓ All transcriptions identical (exact)\n";
+                } else if (text_rate == 100.0) {
+                    std::cout << "~ All text identical, timestamp values differ (BF16 drift)\n";
+                } else {
+                    std::cout << "✗ Correctness check FAILED: " << mismatches << " exact mismatches, "
+                              << (metrics.size() - text_match_count) << " text mismatches\n";
+                }
+            } else if (is_token_mode) {
+                // Continuous batching mode: compare token sequences
+                const ov::AnyMap decode_params = {ov::genai::skip_special_tokens(false)};
+                const ov::AnyMap decode_text_params = {ov::genai::skip_special_tokens(true)};
+
+                // The OV tokenizer emits [OV-DBG] lines directly to stdout fd 1.
+                // Suppress them by temporarily redirecting fd 1 to /dev/null.
+                auto silent_decode = [&](const std::vector<int64_t>& toks, const ov::AnyMap& params) -> std::string {
+                    std::cout.flush();
+                    int saved = dup(STDOUT_FILENO);
+                    int devnull = open("/dev/null", O_WRONLY);
+                    dup2(devnull, STDOUT_FILENO);
+                    close(devnull);
+                    std::string result = tokenizer.decode(toks, params);
+                    fflush(stdout);
+                    dup2(saved, STDOUT_FILENO);
+                    close(saved);
+                    return result;
+                };
+
+                const auto& reference_tokens = metrics[0].tokens;
+                std::string reference_decoded = silent_decode(reference_tokens, decode_params);
+                std::string reference_text_stripped = strip_timestamps(
+                    silent_decode(reference_tokens, decode_text_params));
+
+                std::cout << "Mode: Continuous Batching (token comparison)\n";
+                std::cout << "Reference (request 0): " << reference_tokens.size() << " tokens\n";
+                std::cout << "  Tokens: [";
+                for (size_t i = 0; i < std::min(reference_tokens.size(), size_t(20)); ++i) {
+                    std::cout << reference_tokens[i];
+                    if (i < std::min(reference_tokens.size(), size_t(20)) - 1) std::cout << ", ";
+                }
+                if (reference_tokens.size() > 20) std::cout << " ... (" << reference_tokens.size() - 20 << " more)";
+                std::cout << "]\n";
+                std::cout << "  Decoded (with timestamps): \"" << reference_decoded << "\"\n";
+                std::cout << "  Decoded (text only):       \"" << reference_text_stripped << "\"\n\n";
+
+                size_t text_match_count = 0;
+                for (const auto& m : metrics) {
+                    if (m.tokens == reference_tokens) {
+                        correct_count++;
+                    } else {
+                        mismatches++;
+                        if (mismatches <= 5) {
+                            std::string decoded = silent_decode(m.tokens, decode_params);
+                            std::cout << "  Mismatch in request " << m.request_id
+                                      << ": expected " << reference_tokens.size()
+                                      << " tokens, got " << m.tokens.size() << " tokens\n";
+                            std::cout << "    Tokens: [";
+                            for (size_t i = 0; i < std::min(m.tokens.size(), size_t(20)); ++i) {
+                                std::cout << m.tokens[i];
+                                if (i < std::min(m.tokens.size(), size_t(20)) - 1) std::cout << ", ";
+                            }
+                            std::cout << "]\n";
+                            std::cout << "    Decoded: \"" << decoded << "\"\n";
+                        }
+                    }
+                    std::string got_stripped = strip_timestamps(
+                        silent_decode(m.tokens, decode_text_params));
+                    if (got_stripped == reference_text_stripped)
+                        text_match_count++;
+                }
+
+                double exact_rate = 100.0 * correct_count   / metrics.size();
+                double text_rate  = 100.0 * text_match_count / metrics.size();
+                std::cout << "\nExact match:  " << correct_count    << " / " << metrics.size()
+                          << " (" << exact_rate << "%)\n";
+                std::cout << "Text match:   " << text_match_count  << " / " << metrics.size()
+                          << " (" << text_rate  << "%)  [timestamps stripped]\n";
+
+                if (exact_rate == 100.0) {
+                    std::cout << "✓ All token sequences identical (exact)\n";
+                } else if (text_rate == 100.0) {
+                    std::cout << "~ All text identical, timestamp values differ (BF16 drift)\n";
+                } else {
+                    std::cout << "✗ Correctness check FAILED: " << mismatches << " exact mismatches, "
+                              << (metrics.size() - text_match_count) << " text mismatches\n";
+                }
+            } else {
+                std::cout << "No validation data available\n";
+            }
+        } else {
+            std::cout << "No requests completed for validation\n";
+        }
+
+        // Print the main stats after correctness validation so they are visible
+        // at the bottom of the output (not buried by [OV-DBG] tokenizer lines).
         std::cout << "\n========================================\n";
         std::cout << "Benchmark Results (" << (is_native_mode ? "NATIVE" : "CONTINUOUS BATCHING") << ")\n";
         std::cout << "========================================\n";
@@ -463,114 +580,67 @@ public:
         std::cout << "Average: " << avg_processing << " ms\n";
         std::cout << "p50: " << percentile(processing_times, 0.50) << " ms\n";
         std::cout << "p95: " << percentile(processing_times, 0.95) << " ms\n";
-        
-        // Correctness validation
-        std::cout << "\n--- Correctness Validation (exact match) ---\n";
-        if (!metrics.empty()) {
-            size_t correct_count = 0;
-            size_t mismatches = 0;
-            
-            // Check if we're in native mode (text) or CB mode (tokens)
-            bool is_text_mode = !metrics[0].text.empty();
-            bool is_token_mode = !metrics[0].tokens.empty();
-            
-            if (is_text_mode) {
-                // Native mode: compare text
-                const auto& reference_text = metrics[0].text;
-                std::cout << "Mode: Native (text comparison)\n";
-                std::cout << "Reference text (request 0): \"" << reference_text << "\"\n\n";
-                
-                for (const auto& m : metrics) {
-                    if (m.text == reference_text) {
-                        correct_count++;
-                    } else {
-                        mismatches++;
-                        if (mismatches <= 5) {
-                            std::cout << "  Mismatch in request " << m.request_id 
-                                      << ": got \"" << m.text.substr(0, 60) 
-                                      << (m.text.size() > 60 ? "..." : "") << "\"\n";
-                        }
-                    }
-                }
-                
-                double correctness_rate = 100.0 * correct_count / metrics.size();
-                std::cout << "\nCorrect outputs: " << correct_count << " / " << metrics.size() 
-                          << " (" << correctness_rate << "%)\n";
-                
-                if (correctness_rate == 100.0) {
-                    std::cout << "✓ All transcriptions identical\n";
-                } else {
-                    std::cout << "✗ Correctness check FAILED: " << mismatches << " mismatches detected\n";
-                }
-            } else if (is_token_mode) {
-                // Continuous batching mode: compare token sequences
-                const auto& reference_tokens = metrics[0].tokens;
-                std::string reference_text = tokenizer.decode(reference_tokens, {ov::genai::skip_special_tokens(false)});
-                
-                std::cout << "Mode: Continuous Batching (token comparison)\n";
-                std::cout << "Reference (request 0): " << reference_tokens.size()  << " tokens\n";
-                std::cout << "  Tokens: [";
-                for (size_t i = 0; i < std::min(reference_tokens.size(), size_t(20)); ++i) {
-                    std::cout << reference_tokens[i];
-                    if (i < std::min(reference_tokens.size(), size_t(20)) - 1) std::cout << ", ";
-                }
-                if (reference_tokens.size() > 20) std::cout << " ... (" << reference_tokens.size() - 20 << " more)";
-                std::cout << "]\n";
-                std::cout << "  Decoded text: \"" << reference_text << "\"\n\n";
-                
-                for (const auto& m : metrics) {
-                    if (m.tokens == reference_tokens) {
-                        correct_count++;
-                    } else {
-                        mismatches++;
-                        if (mismatches <= 5) {
-                            std::string decoded_text = tokenizer.decode(m.tokens, {ov::genai::skip_special_tokens(false)});
-                            std::cout << "  Mismatch in request " << m.request_id 
-                                      << ": expected " << reference_tokens.size() 
-                                      << " tokens, got " << m.tokens.size() << " tokens\n";
-                            std::cout << "    Tokens: [";
-                            for (size_t i = 0; i < std::min(m.tokens.size(), size_t(20)); ++i) {
-                                std::cout << m.tokens[i];
-                                if (i < std::min(m.tokens.size(), size_t(20)) - 1) std::cout << ", ";
-                            }
-                            std::cout << "]\n";
-                            std::cout << "    Decoded: \"" << decoded_text << "\"\n";
-                        }
-                    }
-                }
-                
-                double correctness_rate = 100.0 * correct_count / metrics.size();
-                std::cout << "\nCorrect outputs: " << correct_count << " / " << metrics.size() 
-                          << " (" << correctness_rate << "%)\n";
-                
-                if (correctness_rate == 100.0) {
-                    std::cout << "✓ All token sequences identical\n";
-                } else {
-                    std::cout << "✗ Correctness check FAILED: " << mismatches << " mismatches detected\n";
-                }
-            } else {
-                std::cout << "No validation data available\n";
-            }
-        } else {
-            std::cout << "No requests completed for validation\n";
+
+        // --- CB Step Timing Breakdown ---
+        // Only printed for CB mode; cb_final_metrics is zero for native runs.
+        if (!is_native_mode && cb_final_metrics.total_steps > 0) {
+            const double total_fwd_us = cb_final_metrics.prompt_phase_us_total
+                                      + cb_final_metrics.generate_phase_us_total;
+            const double infer_us     = cb_final_metrics.ov_infer_us_total;
+            const double assembly_us  = cb_final_metrics.cross_attn_assembly_us_total;
+            auto pct = [](double num, double den) -> double {
+                return den > 0.0 ? 100.0 * num / den : 0.0;
+            };
+
+            const double avg_gen_batch = cb_final_metrics.generate_steps > 0
+                ? static_cast<double>(cb_final_metrics.generate_batch_token_sum)
+                  / cb_final_metrics.generate_steps
+                : 0.0;
+
+            std::cout << std::fixed << std::setprecision(1);
+            std::cout << "\n--- CB Step Timing Breakdown ---\n";
+            std::cout << "Total forward steps:   " << cb_final_metrics.total_steps << "\n";
+            std::cout << "  GENERATE steps:      " << cb_final_metrics.generate_steps
+                      << "  (avg batch: " << std::setprecision(2) << avg_gen_batch << " seqs/step)\n";
+            std::cout << std::setprecision(1);
+            std::cout << "\nCumulative forward wall time:  " << total_fwd_us / 1000.0 << " ms\n";
+            std::cout << "  PROMPT  phase:       " << cb_final_metrics.prompt_phase_us_total / 1000.0
+                      << " ms  (" << pct(cb_final_metrics.prompt_phase_us_total, total_fwd_us) << "%)\n";
+            std::cout << "  GENERATE phase:      " << cb_final_metrics.generate_phase_us_total / 1000.0
+                      << " ms  (" << pct(cb_final_metrics.generate_phase_us_total, total_fwd_us) << "%)\n";
+            std::cout << "\nOV kernel (infer):     " << infer_us / 1000.0
+                      << " ms  (" << pct(infer_us, total_fwd_us) << "% of fwd time)\n";
+            std::cout << "Cross-attn assembly:   " << assembly_us / 1000.0
+                      << " ms  (" << pct(assembly_us, total_fwd_us) << "% of fwd time,  "
+                      << pct(assembly_us, infer_us) << "% of infer)\n";
+            std::cout << "Other overhead:        "
+                      << (total_fwd_us - infer_us - assembly_us) / 1000.0
+                      << " ms\n";
+            std::cout << "\n[KEY METRIC] Cross-attn assembly / OV infer ratio: "
+                      << std::setprecision(1) << pct(assembly_us, infer_us) << "%\n";
+            std::cout << "  (If this is >10% at N>1 concurrent requests, K/V projection\n"
+                         "   caching (Option 1 in whisper_cb_copilot_recommendation.md)\n"
+                         "   is the right next step.)\n";
         }
-        
+
         std::cout << "========================================\n";
     }
 };
 
 int main(int argc, char* argv[]) try {
     if (argc < 5) {
-        std::cerr << "Usage: " << argv[0] << " <model_path> <audio_file> <request_rate> <duration_seconds> [device] [--is-native]\n";
+        std::cerr << "Usage: " << argv[0] << " <model_path> <audio_file> <request_rate> <duration_seconds> [device] [--is-native] [--burst N]\n";
         std::cerr << "  model_path: Path to the Whisper model directory\n";
         std::cerr << "  audio_file: Path to the WAV audio file\n";
         std::cerr << "  request_rate: Number of requests per second (e.g., 2.0)\n";
         std::cerr << "  duration_seconds: Benchmark duration in seconds (e.g., 60)\n";
         std::cerr << "  device: Optional device (default: CPU)\n";
         std::cerr << "  --is-native: Use native WhisperPipeline (sequential) instead of continuous batching\n";
+        std::cerr << "  --burst N: Add all N requests at once (ignores request_rate and duration_seconds)\n";
         std::cerr << "\nExamples:\n";
         std::cerr << "  Continuous batching: " << argv[0] << " ./whisper-base-openvino ./sample.wav 2.0 30\n";
         std::cerr << "  Native sequential:   " << argv[0] << " ./whisper-base-openvino ./sample.wav 2.0 30 CPU --is-native\n";
+        std::cerr << "  Burst (CB):          " << argv[0] << " ./whisper-base-openvino ./sample.wav 0 0 CPU --burst 10\n";
         return EXIT_FAILURE;
     }
     
@@ -582,18 +652,29 @@ int main(int argc, char* argv[]) try {
     // Parse optional arguments
     std::string device = "CPU";
     bool is_native_mode = false;
+    int burst_count = -1;  // -1 means not set
     
     for (int i = 5; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--is-native") {
             is_native_mode = true;
-        } else if (i == 5) {  // First optional arg is device if not a flag
+        } else if (arg == "--burst") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --burst requires an integer argument\n";
+                return EXIT_FAILURE;
+            }
+            burst_count = std::stoi(argv[++i]);
+            if (burst_count <= 0) {
+                std::cerr << "Error: --burst count must be positive\n";
+                return EXIT_FAILURE;
+            }
+        } else if (i == 5 && arg[0] != '-') {  // First optional positional arg is device
             device = arg;
         }
     }
-    
-    if (request_rate <= 0 || duration_seconds <= 0) {
-        std::cerr << "Error: request_rate and duration must be positive\n";
+
+    if (burst_count < 0 && (request_rate <= 0 || duration_seconds <= 0)) {
+        std::cerr << "Error: request_rate and duration must be positive (or use --burst N)\n";
         return EXIT_FAILURE;
     }
     
@@ -601,18 +682,29 @@ int main(int argc, char* argv[]) try {
     ov::genai::RawSpeechInput raw_speech = utils::audio::read_wav(wav_file_path);
     std::cout << "Audio loaded: " << raw_speech.size() << " samples\n";
     
-    // Setup generation config
-    ov::genai::WhisperPipeline pipeline(models_path.parent_path() / (models_path.filename().string() + "-stateful"), device);
-
-    ov::genai::WhisperGenerationConfig config = pipeline.get_generation_config();
-    config.language = "<|en|>";  // Use language code, not token format
+    // Setup generation config — use a local scope so the WhisperPipeline is
+    // fully destroyed before DynamicBenchmark (and its CB pipeline) is created.
+    // Keeping two compiled CPU models alive simultaneously can cause OV thread-pool
+    // contention that corrupts CB inference when concurrent requests are in flight.
+    ov::genai::WhisperGenerationConfig config;
+    {
+        ov::genai::WhisperPipeline config_pipeline(
+            models_path.parent_path() / (models_path.filename().string() + "-stateful"), device);
+        config = config_pipeline.get_generation_config();
+    }
+    config.language = "<|en|>";
     config.task = "transcribe";
-    config.return_timestamps = false;
-    config.word_timestamps = false;
-    
+    config.return_timestamps = true;
+    config.word_timestamps = false;  // CB pipeline doesn't produce word-level timestamps
+    config.max_new_tokens = 50;
+
     // Run benchmark
     DynamicBenchmark benchmark(models_path, device, raw_speech, config, is_native_mode);
-    benchmark.run(request_rate, duration_seconds);
+    if (burst_count > 0) {
+        benchmark.run_burst(static_cast<size_t>(burst_count));
+    } else {
+        benchmark.run(request_rate, duration_seconds);
+    }
     
     return EXIT_SUCCESS;
     

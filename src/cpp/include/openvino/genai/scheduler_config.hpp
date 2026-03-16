@@ -68,11 +68,22 @@ struct SchedulerConfig {
      */
     SparseAttentionConfig sparse_attention_config;
 
+    /**
+     * Maximum number of tokens to schedule per prefill request per scheduler step.
+     * When set to 0 (default), no additional limit is applied beyond max_num_batched_tokens.
+     * Setting this to 1 forces all prefill tokens through single-token steps, making the
+     * PagedAttention PROMPT path use q_cnt=1 (identical numerics to the GENERATE path).
+     * Useful for encoder-decoder models (e.g. Whisper) where the decoder SOT prefix must
+     * be processed one token at a time to avoid numerical drift from batched GEMM.
+     */
+    std::size_t max_num_tokens_per_prefill_step = 0;
+
     bool operator==(const SchedulerConfig& other) const {
         return max_num_batched_tokens == other.max_num_batched_tokens && num_kv_blocks == other.num_kv_blocks &&
                cache_size == other.cache_size &&
                dynamic_split_fuse == other.dynamic_split_fuse && use_cache_eviction == other.use_cache_eviction &&
-               max_num_seqs == other.max_num_seqs && enable_prefix_caching == other.enable_prefix_caching;
+               max_num_seqs == other.max_num_seqs && enable_prefix_caching == other.enable_prefix_caching &&
+               max_num_tokens_per_prefill_step == other.max_num_tokens_per_prefill_step;
     }
 
     /**
@@ -99,6 +110,7 @@ struct SchedulerConfig {
         if (use_sparse_attention) {
             oss << sparse_attention_config.to_string() << "\n";
         }
+        oss << "  max_num_tokens_per_prefill_step: " << max_num_tokens_per_prefill_step << "\n";
         oss << " }";
         return oss.str();
     }

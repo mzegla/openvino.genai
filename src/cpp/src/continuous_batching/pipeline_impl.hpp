@@ -9,6 +9,7 @@
 #include "continuous_batching/cache_eviction.hpp"
 #include "visual_language/inputs_embedder.hpp"
 #include "whisper/whisper.hpp"
+#include "continuous_batching/cross_kv_cache.hpp"
 
 namespace ov::genai {
 
@@ -40,6 +41,14 @@ protected:
 
     size_t m_num_decoder_layers = 0;
     size_t m_block_size = 0;
+
+    // Cross-attention K/V projector model (extracted during graph surgery).
+    // Null when CROSS_KV_CACHE=0 or for non-Whisper models.
+    std::shared_ptr<ov::Model> m_projector_model;
+    // Compiled projector InferRequest. Stored until first admit() initialises m_cross_kv_cache.
+    ov::InferRequest m_proj_infer_request;
+    // Cross-attention K/V slot buffer. Created lazily on first admit() call.
+    std::unique_ptr<CrossKVCache> m_cross_kv_cache;
 
     // Pre-allocated per-layer storages for the per-token cache re-rotation deltas used in cache eviction case
     std::vector<ov::Tensor> m_rotation_deltas_stores;

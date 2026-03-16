@@ -58,6 +58,23 @@ struct PipelineMetrics {
      * Duration of the last generation step in microseconds.
      */
     float inference_duration = 0.0;
+
+    // --- Whisper CB Profiling (cumulative totals since pipeline creation) ---
+    // Populated every step(); read once after a benchmark run via get_metrics().
+    // cross_attn_assembly_us_total: time spent building the batched encoder_hidden_states
+    //   tensor in model_runner (memcpy N slices → [N,T_enc,D] + set_tensor). Per our current
+    //   design this runs on EVERY forward() call for EVERY step because we bypass the
+    //   ReadValue/Assign state cache.  At rate>1 this cost grows O(N) with batch size.
+    // ov_infer_us_total: actual OV kernel wall time (m_request.infer()).
+    // *_phase_us_total: wall time for PROMPT / TRANSITION / GENERATE forward pass phases.
+    double cross_attn_assembly_us_total = 0.0;  ///< μs: assembling encoder_hidden_states
+    double ov_infer_us_total            = 0.0;  ///< μs: m_request.infer() (OV kernel)
+    double prompt_phase_us_total        = 0.0;  ///< μs: PROMPT forward passes
+    double transition_phase_us_total    = 0.0;  ///< μs: TRANSITION forward passes
+    double generate_phase_us_total      = 0.0;  ///< μs: GENERATE forward passes
+    size_t total_steps                  = 0;    ///< step() calls with at least one forward pass
+    size_t generate_steps               = 0;    ///< steps that included ≥1 GENERATE request
+    size_t generate_batch_token_sum     = 0;    ///< sum of GENERATE batch sizes (tokens) for avg
 };
 
 class OPENVINO_GENAI_EXPORTS ContinuousBatchingPipeline {

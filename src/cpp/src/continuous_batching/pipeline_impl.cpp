@@ -5,7 +5,11 @@
 #include <thread>
 #include <optional>
 #include <cstdlib>
+#include <functional>
+#include <map>
 #include <set>
+#include <queue>
+#include <unordered_set>
 #include "openvino/genai/cache_eviction.hpp"
 
 #ifdef __APPLE__
@@ -28,9 +32,11 @@
 #include "openvino/op/result.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/add.hpp"
+#include "openvino/op/multiply.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/shape_of.hpp"
 #include "openvino/op/gather.hpp"
+#include "openvino/op/transpose.hpp"
 #include "openvino/core/graph_util.hpp"
 #include "openvino/runtime/properties.hpp"
 #include "continuous_batching/pipeline_impl.hpp"
@@ -76,35 +82,277 @@ size_t get_available_cpu_memory() {
     return std::numeric_limits<size_t>::max();
 }
 
+// Returns true when OPENVINO_LOG_LEVEL > 1 (cached after first call).
+static bool cb_verbose() {
+    static const bool val = []() -> bool {
+        const char* e = std::getenv("OPENVINO_LOG_LEVEL");
+        return e && std::atoi(e) > 1;
+    }();
+    return val;
+}
+
+// ---------------------------------------------------------------------------
+// extract_cross_attn_projector()
+//
+// Called AFTER the ReadValue bypass has wired each cross-attn SDPA's K and V
+// inputs directly to their projection subgraph outputs (MatMul → Reshape →
+// Transpose chains that consume encoder_hidden_states).
+//
+// This function:
+//  1. Collects the K/V projection chain output (kv_src) for each cross-attn layer.
+//  2. Wraps those outputs in Result nodes and builds a separate projector ov::Model
+//     with encoder_hidden_states as its single input.
+//  3. Replaces the K/V sources in the decoder with new Parameters named
+//     "cross_kv_K_{l}" / "cross_kv_V_{l}" so the decoder no longer runs the
+//     K/V projection on every infer() call.
+//  4. Removes encoder_hidden_states from the decoder (it has no more consumers).
+//
+// Returns nullptr if CROSS_KV_CACHE=0 env var is set or extraction fails.
+// ---------------------------------------------------------------------------
+static std::shared_ptr<ov::Model> extract_cross_attn_projector(std::shared_ptr<ov::Model>& model) {
+    using namespace ov::op;
+
+    // Honour kill-switch
+    const char* kv_env = std::getenv("CROSS_KV_CACHE");
+    if (kv_env && std::string(kv_env) == "0") {
+        if (cb_verbose()) std::cout << "[ProjectorExtract] CROSS_KV_CACHE=0 — skipping extraction\n";
+        return nullptr;
+    }
+
+    // 1. Find the encoder_hidden_states Parameter — needed before SDPA detection.
+    std::shared_ptr<v0::Parameter> enc_param;
+    for (const auto& param : model->get_parameters()) {
+        // Check tensor names first (StatefulToStateless renames the node)
+        for (const auto& tname : param->get_output_tensor(0).get_names()) {
+            if (tname.find("encoder_hidden_states") != std::string::npos) {
+                enc_param = param;
+                break;
+            }
+        }
+        if (enc_param) break;
+        // Fallback: check friendly name
+        if (param->get_friendly_name().find("encoder_hidden_states") != std::string::npos) {
+            enc_param = param;
+            break;
+        }
+    }
+    if (!enc_param) {
+        std::cout << "[ProjectorExtract] encoder_hidden_states not found — skipping\n";
+        return nullptr;
+    }
+
+    // 2. Collect K/V source outputs for each cross-attn layer, sorted by index.
+    //    Use structural connectivity: find all SDPA nodes where K (input 1) or V (input 2)
+    //    is reachable from encoder_hidden_states.  This is robust to any naming convention.
+    std::map<int, std::pair<ov::Output<ov::Node>, ov::Output<ov::Node>>> layer_kv;
+    {
+        // BFS forward from enc_param to collect all nodes reachable through its outputs.
+        std::unordered_set<ov::Node*> enc_descendants;
+        std::queue<ov::Node*> bfs_q;
+        bfs_q.push(enc_param.get());
+        while (!bfs_q.empty()) {
+            ov::Node* n = bfs_q.front(); bfs_q.pop();
+            if (!enc_descendants.insert(n).second) continue;  // already visited
+            for (size_t oi = 0; oi < n->get_output_size(); ++oi)
+                for (const auto& tgt : n->output(oi).get_target_inputs())
+                    bfs_q.push(tgt.get_node());
+        }
+
+        int seq_idx = 0;  // sequential fallback when name-based extraction fails
+        for (const auto& op : model->get_ordered_ops()) {
+            if (!ov::is_type<v13::ScaledDotProductAttention>(op)) continue;
+            if (op->get_input_size() < 3) continue;
+
+            // The Q input (0) comes from the decoder; K (1) and V (2) from the encoder.
+            bool k_from_enc = enc_descendants.count(op->input(1).get_source_output().get_node()) > 0;
+            bool v_from_enc = enc_descendants.count(op->input(2).get_source_output().get_node()) > 0;
+            if (!k_from_enc && !v_from_enc) continue;
+
+            // Extract layer index from node name; fallback to sequential counter.
+            int layer_idx = seq_idx;
+            const std::string& name = op->get_friendly_name();
+            auto pos_l = name.find("layers.");
+            if (pos_l != std::string::npos) {
+                try { layer_idx = std::stoi(name.substr(pos_l + 7)); } catch (...) {}
+            }
+
+            std::cout << "[ProjectorExtract] cross-attn SDPA: " << name
+                      << "  layer_idx=" << layer_idx << "\n";
+            layer_kv[layer_idx] = { op->input(1).get_source_output(),
+                                     op->input(2).get_source_output() };
+            ++seq_idx;
+        }
+    }
+
+    if (layer_kv.empty()) {
+        std::cout << "[ProjectorExtract] No cross-attn layers found — skipping\n";
+        return nullptr;
+    }
+    std::cout << "[ProjectorExtract] Found " << layer_kv.size() << " cross-attn layers\n";
+
+    // Snapshot each SDPA K/V target inputs BEFORE we add Result nodes (which would
+    // also appear as consumers and must not be redirected to the new Parameters).
+    std::map<int, std::pair<std::vector<ov::Input<ov::Node>>,
+                            std::vector<ov::Input<ov::Node>>>> layer_targets;
+    for (auto& [layer_idx, kv] : layer_kv) {
+        std::vector<ov::Input<ov::Node>> K_tgts, V_tgts;
+        for (auto& inp : kv.first.get_target_inputs())  K_tgts.push_back(inp);
+        for (auto& inp : kv.second.get_target_inputs()) V_tgts.push_back(inp);
+        layer_targets[layer_idx] = { std::move(K_tgts), std::move(V_tgts) };
+    }
+
+    // 3. Build projector model: Result nodes wrapping each K/V source.
+    //
+    // Implementation notes:
+    //   - Clone enc_param → proj_enc_param with a STATIC shape [1, T_enc, D].
+    //   - Move all K/V chain consumers (MatMul nodes) from enc_param to proj_enc_param.
+    //     enc_param now has zero consumers so remove_parameter always succeeds.
+    //   - Register proj_enc_param IN the decoder model too (model->add_parameters).
+    //     OV CPU creates Node objects for ALL operations during compile_model (even dead
+    //     ones) and validates their shapes.  If proj_enc_param is unregistered, OV uses
+    //     a dynamic pseudo-shape for it, causing Reshape_229018 to fail the static-shape
+    //     check at compile time.  Registering it with a concrete static shape avoids this.
+    //   - At runtime, proj_enc_param (decoded name "encoder_hidden_states") receives a
+    //     zero dummy tensor from model_runner; the dead K/V chain is never executed.
+
+    // Determine the static encoder size from enc_param's partial shape.
+    // StatefulToStateless may have already made dim[0] dynamic; fix it to 1.
+    ov::PartialShape proj_ps = enc_param->get_partial_shape();
+    if (proj_ps.rank().is_static() && proj_ps.rank().get_length() == 3)
+        proj_ps[0] = 1;
+
+    auto proj_enc_param = std::make_shared<v0::Parameter>(
+        enc_param->get_element_type(), proj_ps);
+    proj_enc_param->set_friendly_name("encoder_hidden_states");
+    proj_enc_param->get_output_tensor(0).set_names(
+        enc_param->get_output_tensor(0).get_names());
+
+    // Move all enc_param consumers in the decoder K/V chains to proj_enc_param.
+    {
+        std::vector<ov::Input<ov::Node>> enc_targets;
+        for (auto& tgt : enc_param->output(0).get_target_inputs())
+            enc_targets.push_back(tgt);
+        for (auto& tgt : enc_targets)
+            tgt.replace_source_output(proj_enc_param->output(0));
+    }
+    // enc_param now has zero consumers → safe to remove from decoder.
+
+    ov::ResultVector proj_results;
+    for (auto& [layer_idx, kv] : layer_kv) {
+        const std::string name_K = "cross_proj_K_" + std::to_string(layer_idx);
+        const std::string name_V = "cross_proj_V_" + std::to_string(layer_idx);
+
+        auto res_K = std::make_shared<v0::Result>(kv.first);
+        auto res_V = std::make_shared<v0::Result>(kv.second);
+        res_K->set_friendly_name(name_K);
+        res_V->set_friendly_name(name_V);
+        res_K->get_output_tensor(0).set_names({name_K});
+        res_V->get_output_tensor(0).set_names({name_V});
+        proj_results.push_back(res_K);
+        proj_results.push_back(res_V);
+    }
+
+    auto projector = std::make_shared<ov::Model>(proj_results, ov::ParameterVector{proj_enc_param});
+    projector->validate_nodes_and_infer_types();
+
+    if (cb_verbose()) {
+        std::cout << "[ProjectorExtract] Projector model: "
+                  << proj_results.size() << " outputs (" << layer_kv.size() << " layers)\n";
+        for (const auto& out : projector->outputs()) {
+            for (const auto& n : out.get_names())
+                std::cout << "  " << n << "  shape=" << out.get_partial_shape() << "\n";
+        }
+    }
+
+    // 4. Replace K/V source outputs in the decoder with new Parameters.
+    for (auto& [layer_idx, kv] : layer_kv) {
+        auto K_ps = kv.first.get_partial_shape();
+        auto V_ps = kv.second.get_partial_shape();
+        // Make the batch (slot) dimension dynamic so the decoder accepts any N
+        if (K_ps.rank().is_static()) K_ps[0] = ov::Dimension::dynamic();
+        if (V_ps.rank().is_static()) V_ps[0] = ov::Dimension::dynamic();
+
+        const std::string name_K = "cross_kv_K_" + std::to_string(layer_idx);
+        const std::string name_V = "cross_kv_V_" + std::to_string(layer_idx);
+
+        auto param_K = std::make_shared<v0::Parameter>(kv.first.get_element_type(),  K_ps);
+        auto param_V = std::make_shared<v0::Parameter>(kv.second.get_element_type(), V_ps);
+        param_K->set_friendly_name(name_K);
+        param_V->set_friendly_name(name_V);
+        param_K->get_output_tensor(0).set_names({name_K});
+        param_V->get_output_tensor(0).set_names({name_V});
+
+        // Redirect only the pre-captured SDPA targets (not the projector Result nodes)
+        for (auto& tgt : layer_targets[layer_idx].first)
+            tgt.replace_source_output(param_K->output(0));
+        for (auto& tgt : layer_targets[layer_idx].second)
+            tgt.replace_source_output(param_V->output(0));
+
+        model->add_parameters({param_K, param_V});
+        if (cb_verbose())
+            std::cout << "[ProjectorExtract] Layer " << layer_idx
+                      << ": decoder params " << name_K << " + " << name_V << " added\n";
+    }
+
+    // 5. Remove the original enc_param from the decoder.
+    //
+    // After step 3, all enc_param consumers in the decoder were moved to proj_enc_param.
+    // After step 4, all SDPA K/V inputs were redirected to the fresh cross_kv_K/V params.
+    // The K/V projection chain (proj_enc_param → MatMul → Reshape → Transpose → proj_results)
+    // is part of the PROJECTOR model only, not the decoder model.  OV's get_ordered_ops()
+    // traverses backward from decoder Results — it never reaches proj_enc_param's chain,
+    // so those nodes are invisible to the decoder's compile_model and do not need explicit
+    // removal.  We only need to drop enc_param itself (zero consumers now).
+    //
+    // Note: we intentionally do NOT call ov::replace_node(proj_enc_param, zero_const):
+    //   - proj_enc_param is shared with the projector model — replacing it would break the
+    //     projector's input.
+    //   - The dead K/V chain is already outside the decoder model's op-set; no DCE needed.
+    try {
+        model->remove_parameter(enc_param);
+        if (cb_verbose())
+            std::cout << "[ProjectorExtract] Original encoder_hidden_states removed from decoder.\n";
+    } catch (const std::exception& e) {
+        std::cout << "[ProjectorExtract] WARNING: could not remove enc_param: " << e.what() << "\n";
+    }
+
+    model->validate_nodes_and_infer_types();
+    if (cb_verbose())
+        std::cout << "[ProjectorExtract] Done — decoder now has "
+                  << 2 * layer_kv.size() << " cross-KV parameter inputs\n\n";
+
+    return projector;
+}
+
 // Helper function to apply selective PA transformation (self-attention only)
-void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
+std::shared_ptr<ov::Model> apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
     using namespace ov::op;
 
     std::vector<std::shared_ptr<ov::Node>> self_attn_nodes;
     std::vector<std::shared_ptr<ov::Node>> cross_attn_nodes;
 
     // Find all ScaledDotProductAttention nodes and classify them
-    std::cout << "Analyzing SDPA nodes for selective PA transformation...\n";
+    if (cb_verbose()) std::cout << "Analyzing SDPA nodes for selective PA transformation...\n";
     for (const auto& node : model->get_ops()) {
         if (ov::is_type<ov::op::v13::ScaledDotProductAttention>(node)) {
             std::string node_name = node->get_friendly_name();
             if (node_name.find("encoder_attn") != std::string::npos || 
                 node_name.find("cross_attn") != std::string::npos) {
                 cross_attn_nodes.push_back(node);
-                std::cout << "  Cross-attention SDPA: " << node_name << "\n";
+                if (cb_verbose()) std::cout << "  Cross-attention SDPA: " << node_name << "\n";
             } else {
                 self_attn_nodes.push_back(node);
-                std::cout << "  Self-attention SDPA: " << node_name << "\n";
+                if (cb_verbose()) std::cout << "  Self-attention SDPA: " << node_name << "\n";
             }
         }
     }
 
-    std::cout << "Found " << self_attn_nodes.size() << " self-attention SDPA nodes\n";
-    std::cout << "Found " << cross_attn_nodes.size() << " cross-attention SDPA nodes\n\n";
+    if (cb_verbose()) std::cout << "Found " << self_attn_nodes.size() << " self-attention SDPA nodes\n";
+    if (cb_verbose()) std::cout << "Found " << cross_attn_nodes.size() << " cross-attention SDPA nodes\n\n";
 
     if (self_attn_nodes.empty()) {
-        std::cout << "No self-attention SDPA nodes to transform\n";
-        return;
+        if (cb_verbose()) std::cout << "No self-attention SDPA nodes to transform\n";
+        return nullptr;
     }
 
     // Store cross-attention connections before transformation
@@ -125,65 +373,127 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
         cross_attn_info.push_back(info);
     }
 
+    // ROOT CAUSE FIX: Whisper exports decoder self-attention as SDPA with is_causal=false
+    // plus an explicit triangular mask tensor.  SDPAToPagedAttention honours is_causal=false
+    // and produces a PA node that relies on the mask, which the PA kernel does not receive
+    // (and does not accept as an input).  The resulting attention is non-causal during
+    // prefill, producing completely wrong ("." loop) outputs.  Replace each self-attention
+    // SDPA with an is_causal=true node so the pass creates a correctly-causal PA node.
+    //
+    // NOTE: PagedAttentionExtension itself has no "is_causal" attribute.  Causality during
+    // multi-token PROMPT prefill is applied internally by the kernel based on token
+    // positions.  There is a known numerical difference between the kernel's PROMPT path
+    // (M>1 tokens processed together) and GENERATE path (M=1 tokens, one at a time): due
+    // to different accumulation order / block-boundary reductions, the floating-point
+    // results differ by small amounts that accumulate over ~6 decode steps and eventually
+    // flip the top-1 prediction from the correct timestamp to a wrong EOT.  The workaround
+    // is to set max_num_batched_tokens=1 in SchedulerConfig so every token goes through the
+    // numerically stable GENERATE path (see whisper_speech_recognition.cpp).
+    // ROOT CAUSE FIX (revised): The previous version kept the explicit triangular mask
+    // wired into the causal SDPA node.  Per the OV SDPA v13 spec, is_causal=true PLUS a
+    // mask input adds the mask as an additional attention bias on top of the built-in
+    // triangular mask — i.e. double-masking.  Whisper's original mask has −∞ in the upper
+    // triangle, so the double-masked positions receive doubly-negative logits before
+    // softmax.  This subtly changes the softmax denominator for every row vs the clean
+    // is_causal-only path, producing the PROMPT-path floating-point drift that causes
+    // ts_prob to drop from ~51% (correct) to ~14.6% (below the forcing threshold) with
+    // M>1 batched prefill.  Fix: always drop the mask and use the 3-input form so the
+    // resulting PA node sees pure causal attention with no extra masking.
+    // NOTE: An is_causal=true pre-patch was attempted here to address M>1 PROMPT-path
+    // failures, but all forms of ov::replace_node(sa_node, causal_sdpa) proved harmful:
+    //   - Keeping original mask: double-masking → FP drift → early EOT with M>1
+    //   - Dropping mask (3-input): beam_idx becomes disconnected → SDPAToPagedAttention
+    //     throws "undeclared parameters: beam_idx"
+    //   - Zeroed mask via Multiply: Multiply node in mask path breaks StateManagementPattern
+    //     matching for ≥1 self-attention SDPA node, leaving it unconverted → loop even M=1
+    // Additionally, SDPAToPagedAttention ignores is_causal entirely (confirmed from source).
+    // The pre-patch is therefore a no-op at best, graph-breaking at worst.  It is removed.
+    //
+    // M>1 PROMPT-path failure ("."-loop) root cause: the PagedAttention PROMPT path
+    // (q_cnt>1, batched GEMM) and GENERATE path (q_cnt=1, sequential GEMM) accumulate
+    // floating-point in different orders, producing slightly different K/V values in the
+    // KV-cache blocks.  These differences cascade over ~6 decode steps and flip the top-1
+    // prediction from the correct timestamp token to wrong ones.
+    //
+    // SOLUTION: Set SchedulerConfig::max_num_tokens_per_prefill_step=1 to force all
+    // prefill tokens through single-token steps (q_cnt=1 → GENERATE path numerics),
+    // while still allowing GENERATE-phase tokens from multiple concurrent requests to be
+    // batched together up to max_num_batched_tokens.  See whisper_speech_recognition.cpp.
+
     // Apply SDPAToPagedAttention transformation to entire model
-    std::cout << "Applying SDPAToPagedAttention transformation...\n";
+    if (cb_verbose()) std::cout << "Applying SDPAToPagedAttention transformation...\n";
     ov::pass::SDPAToPagedAttention(false, false, false, false, false, false).run_on_model(model);
-    std::cout << "Transformation complete!\n\n";
+    if (cb_verbose()) std::cout << "Transformation complete!\n\n";
 
     // Debug: print model parameters AFTER transformation to see what StatefulToStateless created
-    std::cout << "=== MODEL PARAMETERS AFTER SDPAToPagedAttention ===\n";
+    if (cb_verbose()) std::cout << "=== MODEL PARAMETERS AFTER SDPAToPagedAttention ===\n";
     for (const auto& param : model->get_parameters()) {
-        std::cout << "  PARAM: " << param->get_friendly_name() 
+        if (cb_verbose()) std::cout << "  PARAM: " << param->get_friendly_name() 
                   << " shape=" << param->get_output_partial_shape(0) << "\n";
     }
-    // Debug: print all PA nodes and their first 3 input source names
-    std::cout << "=== PA NODES AFTER TRANSFORMATION ===\n";
+    // Debug: print all PA nodes and their Q/K/V input sources.
+    // NOTE: PagedAttentionExtension has NO is_causal attribute — causality is hardcoded
+    // into the kernel (applies a lower-triangular mask for multi-token / PROMPT mode).
+    // The sliding_window input (index 10) = 0 for standard causal LLMs (no sliding window).
+    if (cb_verbose()) std::cout << "=== PA NODES AFTER TRANSFORMATION ===\n";
+    int pa_count = 0;
     for (const auto& op : model->get_ops()) {
         if (op->get_type_info().name == std::string("PagedAttentionExtension")) {
-            std::cout << "  PA: " << op->get_friendly_name() << "\n";
+            ++pa_count;
+            if (cb_verbose()) std::cout << "  PA[" << pa_count << "]: " << op->get_friendly_name()
+                      << "  num_inputs=" << op->get_input_size() << "\n";
             for (size_t i = 0; i < std::min(op->get_input_size(), size_t(3)); ++i) {
                 auto src = op->input(i).get_source_output();
-                std::cout << "    input[" << i << "]: " << src.get_node()->get_friendly_name()
+                if (cb_verbose()) std::cout << "    input[" << i << "]: " << src.get_node()->get_friendly_name()
                           << " type=" << src.get_node()->get_type_info().name << "\n";
+            }
+            // Print sliding_window value (index 10) if it's a constant
+            if (op->get_input_size() > 10) {
+                auto sw_src = op->input(10).get_source_output();
+                if (auto sw_const = ov::as_type_ptr<ov::op::v0::Constant>(sw_src.get_node_shared_ptr())) {
+                    auto sw_val = sw_const->cast_vector<int32_t>();
+                    if (cb_verbose()) std::cout << "    sliding_window (input[10]): " << (sw_val.empty() ? "empty" : std::to_string(sw_val[0])) << "\n";
+                }
             }
         }
     }
-    std::cout << "=================================================\n\n";
+    if (cb_verbose()) std::cout << "Total PA nodes: " << pa_count << "\n";
+    if (cb_verbose()) std::cout << "=================================================\n\n";
 
     // Debug: inspect cross-attention info after transformation
-    std::cout << "=== CROSS-ATTN INFO AFTER TRANSFORMATION ===\n";
+    if (cb_verbose()) std::cout << "=== CROSS-ATTN INFO AFTER TRANSFORMATION ===\n";
     for (const auto& info : cross_attn_info) {
-        std::cout << "  CrossAttn: " << info.friendly_name << "\n";
+        if (cb_verbose()) std::cout << "  CrossAttn: " << info.friendly_name << "\n";
         // Is the original SDPA node still in the model?
         bool node_in_model = false;
         for (const auto& op : model->get_ops()) {
             if (op.get() == info.node.get()) { node_in_model = true; break; }
         }
-        std::cout << "    original SDPA node still in model: " << (node_in_model ? "YES" : "NO") << "\n";
+        if (cb_verbose()) std::cout << "    original SDPA node still in model: " << (node_in_model ? "YES" : "NO") << "\n";
         for (size_t i = 0; i < info.inputs.size(); ++i) {
             auto* inp_node = info.inputs[i].get_node();
             bool in_model = false;
             for (const auto& op : model->get_ops()) {
                 if (op.get() == inp_node) { in_model = true; break; }
             }
-            std::cout << "    input[" << i << "]: " << inp_node->get_friendly_name()
+            if (cb_verbose()) std::cout << "    input[" << i << "]: " << inp_node->get_friendly_name()
                       << " type=" << inp_node->get_type_info().name
                       << " in_model=" << (in_model ? "YES" : "NO") << "\n";
         }
     }
     // Debug: print remaining SDPA nodes (cross-attn should still be here)
-    std::cout << "=== SDPA NODES AFTER TRANSFORMATION ===\n";
+    if (cb_verbose()) std::cout << "=== SDPA NODES AFTER TRANSFORMATION ===\n";
     for (const auto& op : model->get_ops()) {
         if (ov::is_type<ov::op::v13::ScaledDotProductAttention>(op)) {
-            std::cout << "  SDPA: " << op->get_friendly_name() << "\n";
+            if (cb_verbose()) std::cout << "  SDPA: " << op->get_friendly_name() << "\n";
             for (size_t i = 0; i < op->get_input_size(); ++i) {
                 auto src = op->input(i).get_source_output();
-                std::cout << "    input[" << i << "]: " << src.get_node()->get_friendly_name()
+                if (cb_verbose()) std::cout << "    input[" << i << "]: " << src.get_node()->get_friendly_name()
                           << " type=" << src.get_node()->get_type_info().name << "\n";
             }
         }
     }
-    std::cout << "============================================\n\n";
+    if (cb_verbose()) std::cout << "============================================\n\n";
 
     // ---- Bypass cross-attention ReadValue/Assign state nodes ----
     // After SDPAToPagedAttention (including StatefulToStateless), the cross-attention K/V
@@ -194,7 +504,7 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
     // Fix: replace each ReadValue directly with its init subgraph output so that
     // cross-attention always computes from the live encoder_hidden_states input.
     {
-        std::cout << "Bypassing cross-attention ReadValue/Assign state nodes...\n";
+        if (cb_verbose()) std::cout << "Bypassing cross-attention ReadValue/Assign state nodes...\n";
         std::set<std::string> cross_attn_var_ids;
 
         for (const auto& op : model->get_ops()) {
@@ -224,7 +534,7 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
                 for (auto& target : src_node->output(0).get_target_inputs())
                     target.replace_source_output(init_value);
 
-                std::cout << "  ReadValue '" << src_node->get_friendly_name()
+                if (cb_verbose()) std::cout << "  ReadValue '" << src_node->get_friendly_name()
                           << "' (var=" << var_id << ") bypassed\n";
             }
         }
@@ -246,9 +556,9 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
         }
         for (const auto& sink : sinks_to_remove) {
             model->remove_sink(sink);
-            std::cout << "  Assign '" << sink->get_friendly_name() << "' removed\n";
+            if (cb_verbose()) std::cout << "  Assign '" << sink->get_friendly_name() << "' removed\n";
         }
-        std::cout << "  Cross-attention bypass complete ("
+        if (cb_verbose()) std::cout << "  Cross-attention bypass complete ("
                   << cross_attn_var_ids.size() << " state variable(s) removed)\n\n";
 
         // Fix lm_head MatMul all-zero output caused by CPU plugin fusing LayerNorm+MatMul
@@ -273,11 +583,11 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
 
             auto lm_node = result->input(0).get_source_output().get_node_shared_ptr();
             if (!ov::as_type_ptr<ov::op::v0::MatMul>(lm_node)) {
-                std::cout << "  lm_head fix: node before logits result is NOT a MatMul ("
+                if (cb_verbose()) std::cout << "  lm_head fix: node before logits result is NOT a MatMul ("
                           << lm_node->get_type_name() << "), skipping\n";
                 break;
             }
-            std::cout << "  lm_head fix: found MatMul '"
+            if (cb_verbose()) std::cout << "  lm_head fix: found MatMul '"
                       << lm_node->get_friendly_name() << "'\n";
 
             // ROOT CAUSE (confirmed): CPU plugin's AMX BF16 tiled GEMM kernel for M>1
@@ -291,7 +601,7 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
 
             // 1. Capture activation A and add debug tap
             auto A = lm_node->input(0).get_source_output();
-            std::cout << "  lm_head fix: A input from '"
+            if (cb_verbose()) std::cout << "  lm_head fix: A input from '"
                       << A.get_node()->get_friendly_name()
                       << "'  type=" << A.get_element_type().get_type_name() << "\n";
             {
@@ -310,7 +620,7 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
                     if (auto c = ov::as_type_ptr<ov::op::v0::Constant>(wn)) {
                         const auto& orig_shape = c->get_shape();
                         if (orig_shape.size() != 2) {
-                            std::cout << "  lm_head fix: WARNING – weight rank != 2, skipping\n";
+                            if (cb_verbose()) std::cout << "  lm_head fix: WARNING – weight rank != 2, skipping\n";
                             break;
                         }
                         // Weight shape: [V, H] with transpose_b=true  →  keep [V, H], cast to f32
@@ -319,7 +629,7 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
                         auto fp32_w = std::make_shared<ov::op::v0::Constant>(
                             ov::element::f32, orig_shape, fp32_data);
                         fp32_w->set_friendly_name(c->get_friendly_name() + "_fp32");
-                        std::cout << "  lm_head fix: weight [" << V << "," << H << "] cast to f32\n";
+                        if (cb_verbose()) std::cout << "  lm_head fix: weight [" << V << "," << H << "] cast to f32\n";
 
                         // 3. Flatten activation: [bs, T, H] → [bs*T, H]
                         auto flatten_shape_const = std::make_shared<ov::op::v0::Constant>(
@@ -328,14 +638,14 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
                         auto A_flat = std::make_shared<ov::op::v1::Reshape>(
                             A, flatten_shape_const->output(0), /*special_zero=*/false);
                         A_flat->set_friendly_name("lm_head_A_flat");
-                        std::cout << "  lm_head fix: flatten reshape [bs,T," << H << "] → [bs*T," << H << "]\n";
+                        if (cb_verbose()) std::cout << "  lm_head fix: flatten reshape [bs,T," << H << "] → [bs*T," << H << "]\n";
 
                         // 4. MatMul [bs*T, H] x [V, H]^T → [bs*T, V]  (original transpose_b=true)
                         auto new_mm = std::make_shared<ov::op::v0::MatMul>(
                             A_flat, fp32_w->output(0),
                             /*transpose_a=*/false, /*transpose_b=*/true);
                         new_mm->set_friendly_name(lm_node->get_friendly_name() + "_flat");
-                        std::cout << "  lm_head fix: new MatMul [bs*T," << H << "] x [" << V << "," << H << "]^T\n";
+                        if (cb_verbose()) std::cout << "  lm_head fix: new MatMul [bs*T," << H << "] x [" << V << "," << H << "]^T\n";
 
                         // 5. Unflatten: [bs*T, V] → [bs, T, V]
                         // Build output shape dynamically from A's shape: ShapeOf(A)[0:2] ++ [V]
@@ -353,14 +663,14 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
                         auto mm_unflat = std::make_shared<ov::op::v1::Reshape>(
                             new_mm->output(0), out_shape->output(0), /*special_zero=*/false);
                         mm_unflat->set_friendly_name(lm_node->get_friendly_name() + "_unflat");
-                        std::cout << "  lm_head fix: unflatten reshape [bs*T," << V << "] → [bs,T," << V << "]\n";
+                        if (cb_verbose()) std::cout << "  lm_head fix: unflatten reshape [bs*T," << V << "] → [bs,T," << V << "]\n";
 
                         // 6. Replace old lm_node with mm_unflat for all consumers
                         auto old_names = lm_node->output(0).get_tensor().get_names();
                         mm_unflat->output(0).get_tensor().set_names(old_names);
                         lm_node->output(0).get_tensor().set_names({});
                         ov::replace_node(lm_node, mm_unflat);
-                        std::cout << "  lm_head fix: ov::replace_node → flatten/unflatten done\n";
+                        if (cb_verbose()) std::cout << "  lm_head fix: ov::replace_node → flatten/unflatten done\n";
 
                         new_matmul_done = true;
                         break;
@@ -369,7 +679,7 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
                     w = wn->input(0).get_source_output();
                 }
                 if (!new_matmul_done)
-                    std::cout << "  lm_head fix: WARNING – could not locate weight Constant\n";
+                    if (cb_verbose()) std::cout << "  lm_head fix: WARNING – could not locate weight Constant\n";
             }
             break;
         }
@@ -378,7 +688,7 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
             model->add_results({dr});
         // Force OV to re-validate topology and infer shapes after all graph edits
         model->validate_nodes_and_infer_types();
-        std::cout << "  lm_head fix: model validated and shape inference refreshed\n";
+        if (cb_verbose()) std::cout << "  lm_head fix: model validated and shape inference refreshed\n";
 
     }  // end apply_selective_pa_transformation
 
@@ -447,7 +757,7 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
                     ov::Output<ov::Node> k_input, v_input;
                     if (info.inputs.size() > 1 && is_in_model_graph(info.inputs[1])) {
                         k_input = info.inputs[1];
-                        std::cout << "  K: using original graph input (still in model)\n";
+                        if (cb_verbose()) std::cout << "  K: using original graph input (still in model)\n";
                     } else {
                         // info.inputs[1] is orphaned - find K through the PA node's inputs
                         // PA node inputs after transformation: [Q, ..., block_indices, ...]
@@ -458,18 +768,18 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
                         } else {
                             k_input = info.inputs[1]; // fallback even if orphaned
                         }
-                        std::cout << "  K: using PA node input (original was orphaned)\n";
+                        if (cb_verbose()) std::cout << "  K: using PA node input (original was orphaned)\n";
                     }
                     if (info.inputs.size() > 2 && is_in_model_graph(info.inputs[2])) {
                         v_input = info.inputs[2];
-                        std::cout << "  V: using original graph input (still in model)\n";
+                        if (cb_verbose()) std::cout << "  V: using original graph input (still in model)\n";
                     } else {
                         if (node->get_input_size() > 2) {
                             v_input = find_encoder_proj(node->input(2).get_source_output());
                         } else {
                             v_input = info.inputs[2]; // fallback even if orphaned
                         }
-                        std::cout << "  V: using PA node input (original was orphaned)\n";
+                        if (cb_verbose()) std::cout << "  V: using PA node input (original was orphaned)\n";
                     }
 
                     // Q input for restored cross-attention SDPA:
@@ -479,7 +789,7 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
                     // is garbage.  Instead, get Q from the live cross-attention PA node's
                     // input(0), which was correctly updated by ov::replace_node.
                     auto q_input = node->input(0).get_source_output();
-                    std::cout << "  Q: from live PA input(0): '"
+                    if (cb_verbose()) std::cout << "  Q: from live PA input(0): '"
                               << q_input.get_node()->get_friendly_name() << "'\n";
 
                     std::shared_ptr<ov::Node> new_sdpa;
@@ -492,13 +802,225 @@ void apply_selective_pa_transformation(std::shared_ptr<ov::Model> model) {
                     }
                     new_sdpa->set_friendly_name(info.friendly_name);
                     ov::replace_node(node, new_sdpa);
-                    std::cout << "  Restored: " << new_sdpa->get_friendly_name() << "\n";
+                    if (cb_verbose()) std::cout << "  Restored: " << new_sdpa->get_friendly_name() << "\n";
                     break;
                 }
             }
         }
     }
-    std::cout << "Selective PA transformation complete!\n\n";
+
+    // ---- Extract cross-attention K/V projector (Option A: slot buffer) ----
+    // Must run AFTER ReadValue bypass (K/V wired to projection chains) and
+    // AFTER cross-attention SDPA restoration, but BEFORE segmented CA so
+    // that the new cross_kv_K/V Parameters become the K/V sources in the
+    // segmented SDPA nodes that are about to be created.
+    std::shared_ptr<ov::Model> projector_model = extract_cross_attn_projector(model);
+
+    // ---- Segmented cross-attention: per-sequence encoder K/V routing ----
+    // With max_num_tokens_per_prefill_step=1, every scheduled sequence contributes exactly
+    // 1 token per step (both PROMPT and GENERATE). So total_tokens == N (num sequences).
+    // Cross-attention Q in flat batch: [1, n_heads, N, head_dim].
+    // We need token i to attend to encoder K/V for sequence i, not a single broadcast state.
+    //
+    // Technique (no custom op):
+    //   Transpose Q perm [2,1,0,3]: [1, n_heads, N, head_dim] → [N, n_heads, 1, head_dim]
+    //   Now batched SDPA sees batch=N, each sequence has 1 query attending to T_enc keys.
+    //   K/V projections on encoder_hidden_states [N, T_enc, D] → [N, n_heads, T_enc, head_dim].
+    //   Transpose output back (same perm, self-inverse): [N, n_heads, 1, head_dim] → [1, n_heads, N, head_dim].
+    //
+    // model_runner.hpp builds encoder_hidden_states as [N, T_enc, D] per scheduled sequence.
+    //
+    // Set SKIP_SEGMENTED_CA=1 to bypass this block for comparison testing.
+    const bool skip_segmented_ca = (std::getenv("SKIP_SEGMENTED_CA") != nullptr &&
+                                    std::string(std::getenv("SKIP_SEGMENTED_CA")) == "1");
+    if (skip_segmented_ca)
+        if (cb_verbose()) std::cout << "SKIP_SEGMENTED_CA=1: skipping segmented cross-attention transform.\n";
+    if (!skip_segmented_ca) {
+        if (cb_verbose()) std::cout << "=== SEGMENTED CROSS-ATTENTION TRANSFORMATION ===\n";
+
+        // 1. Snapshot live ops BEFORE changing any parameter shapes.
+        //    IMPORTANT: set_partial_shape() on encoder_hidden_states must happen AFTER this
+        //    snapshot and AFTER all replace_node() calls.  Calling set_partial_shape() first
+        //    causes OV to immediately propagate the dynamic batch dim through every
+        //    downstream node (K/V projection Reshapes, MatMuls, etc.).  Some of those nodes
+        //    are Constant nodes whose data buffers OV tries to reallocate from the new
+        //    (dynamic → SIZE_MAX) shape, throwing "cannot create std::vector larger than
+        //    max_size()".  By deferring the shape change to just before validate(), we avoid
+        //    premature propagation entirely.
+        //
+        //    CRITICAL: bind get_ordered_ops() to a named variable BEFORE calling .begin()
+        //    and .end().  Writing:
+        //        vector<...> v(model->get_ordered_ops().begin(),
+        //                      model->get_ordered_ops().end())
+        //    calls get_ordered_ops() TWICE, producing two different temporary NodeVectors.
+        //    .begin() comes from T1 and .end() comes from T2 — iterating between them is
+        //    undefined behaviour and walks off the end of T1 into garbage memory → SIGSEGV.
+        auto ops_snap = model->get_ordered_ops();
+        const std::vector<int64_t> perm{2, 1, 0, 3};
+        int seg_count = 0;
+        for (const auto& op : ops_snap) {
+            if (!ov::is_type<v13::ScaledDotProductAttention>(op)) continue;
+            const std::string& name = op->get_friendly_name();
+            if (name.find("encoder_attn") == std::string::npos &&
+                name.find("cross_attn")   == std::string::npos) continue;
+
+            // Transpose Q: [1, n_heads, N, head_dim] → [N, n_heads, 1, head_dim]
+            auto perm_pre = v0::Constant::create(ov::element::i64, ov::Shape{4}, perm);
+            auto q_t = std::make_shared<v1::Transpose>(
+                op->input(0).get_source_output(), perm_pre);
+            q_t->set_friendly_name(name + "/q_seq_t");
+
+            // New SDPA forwarding ALL original inputs (Q, K, V, optional mask, optional scale).
+            // CRITICAL: the original cross-attention SDPA may have 5 inputs:
+            //   input[3] = attention mask (ConvertLike, encoder_attn-specific)
+            //   input[4] = explicit scale  (ConvertLike, shared from self_attn layers.0)
+            // Dropping input[4] causes OV to fall back to 1/sqrt(head_dim) which differs
+            // from the model's own scale, breaking all N including N=1.
+            // Strategy: replace only Q (input 0) with q_t; pass inputs 1..N-1 unchanged.
+            std::shared_ptr<v13::ScaledDotProductAttention> new_sdpa;
+            const size_t n_inputs = op->get_input_size();
+            if (n_inputs >= 5) {
+                new_sdpa = std::make_shared<v13::ScaledDotProductAttention>(
+                    q_t->output(0),
+                    op->input(1).get_source_output(),
+                    op->input(2).get_source_output(),
+                    op->input(3).get_source_output(),  // attn_mask
+                    op->input(4).get_source_output(),  // scale
+                    /*causal=*/false);
+            } else if (n_inputs == 4) {
+                new_sdpa = std::make_shared<v13::ScaledDotProductAttention>(
+                    q_t->output(0),
+                    op->input(1).get_source_output(),
+                    op->input(2).get_source_output(),
+                    op->input(3).get_source_output(),  // attn_mask or scale
+                    /*causal=*/false);
+            } else {
+                new_sdpa = std::make_shared<v13::ScaledDotProductAttention>(
+                    q_t->output(0),
+                    op->input(1).get_source_output(),
+                    op->input(2).get_source_output(),
+                    /*causal=*/false);
+            }
+            if (cb_verbose()) std::cout << "  [seg] n_inputs=" << n_inputs
+                      << " -> forwarding " << (n_inputs - 1) << " non-Q inputs\n";
+            new_sdpa->set_friendly_name(name + "/seg");
+
+            // Transpose output back: [N, n_heads, 1, head_dim] → [1, n_heads, N, head_dim]
+            auto perm_post = v0::Constant::create(ov::element::i64, ov::Shape{4}, perm);
+            auto out_t = std::make_shared<v1::Transpose>(new_sdpa->output(0), perm_post);
+            out_t->set_friendly_name(name + "/out_seq_t");
+
+            // Transfer tensor names so downstream references still resolve
+            out_t->output(0).get_tensor().set_names(
+                op->output(0).get_tensor().get_names());
+            op->output(0).get_tensor().set_names({});
+
+            ov::replace_node(op, out_t);
+            if (cb_verbose()) std::cout << "  [" << ++seg_count << "] Segmented: '" << name << "'\n";
+        }
+
+        // Note: the encoder_hidden_states parameter (originally named "encoder_hidden_states")
+        // is renamed to "Parameter_XXXXX" by SDPAToPagedAttention / StatefulToStateless, but
+        // its tensor_name remains "encoder_hidden_states".  StatefulToStateless already creates
+        // it with a fully-dynamic shape [-1, -1, D], so no set_partial_shape is needed here.
+        // model_runner.hpp passes [N, T_enc, D] at runtime; OV accepts any N≥1.
+
+        // IMPORTANT: must call validate_nodes_and_infer_types() here, INSIDE the function,
+        // after all replace_node() calls.  Without this, the output shape metadata on the
+        // out_seq_t Transpose nodes (which replaced the original SDPA nodes) is stale/unknown.
+        // The consumer Transpose_3 nodes still see the old SDPA output shape from before
+        // replace_node(), and the CPU plugin uses those stale shapes during execution,
+        // producing completely wrong attention outputs (timestamp-doubling loop) even for N=1.
+        model->validate_nodes_and_infer_types();
+        if (cb_verbose()) std::cout << "  " << seg_count << " cross-attention layer(s) segmented.\n";
+
+        // ---- Per-layer hidden-state debug taps ----
+        // For each decoder layer we add three Result nodes so model_runner can compare
+        // pos[0] vs pos[1] and find where req2's hidden state diverges from req1's:
+        //   DEBUG_selfattn_LN  – PA self-attention output (before residual add)
+        //   DEBUG_xattn_LN     – segmented cross-attention out_seq_t (before residual add)
+        //   DEBUG_ffn_LN       – layer output after FFN + residual (full layer output)
+        //
+        // Strategy:
+        //  • out_seq_t nodes are already named "…/out_seq_t" and easy to find.
+        //  • Self-attn PA nodes: locate by type + layer name.
+        //  • FFN output = the Add node that is the last op of each layer before
+        //    the next layer's self-attn input.  We use a simple heuristic: the Add
+        //    whose direct consumer is the next layer's first LayerNorm (or the final LN).
+        {
+            std::vector<std::shared_ptr<ov::op::v0::Result>> dbg_results;
+            // Map layer index → out_seq_t node (cross-attention output)
+            std::map<int, std::shared_ptr<ov::Node>> layer_xattn;
+            for (const auto& op : model->get_ordered_ops()) {
+                const std::string& n = op->get_friendly_name();
+                if (n.find("/out_seq_t") == std::string::npos) continue;
+                // Extract layer index from name like "model.decoder.layers.2.encoder_attn/out_seq_t"
+                auto pos_l = n.find("layers.");
+                if (pos_l == std::string::npos) continue;
+                int layer_idx = std::stoi(n.substr(pos_l + 7));
+                layer_xattn[layer_idx] = op;
+            }
+            for (auto& [layer_idx, xattn_node] : layer_xattn) {
+                // Cross-attention tap: shape [1, n_heads, N, head_dim] — already 4D
+                auto dbg_xattn = std::make_shared<ov::op::v0::Result>(xattn_node->output(0));
+                std::string xattn_name = "DEBUG_xattn_L" + std::to_string(layer_idx);
+                dbg_xattn->set_friendly_name(xattn_name);
+                dbg_xattn->get_output_tensor(0).set_names({xattn_name});
+                dbg_results.push_back(dbg_xattn);
+
+                // Cross-attention residual Add tap: walk consumers of out_seq_t to find the
+                // downstream Add (the residual connection).  It's typically 1-2 hops away
+                // (possibly through a Transpose that undoes the head layout before adding).
+                // We find the first Add among consumers (BFS depth ≤ 4).
+                std::function<std::shared_ptr<ov::Node>(std::shared_ptr<ov::Node>, int)> find_add;
+                find_add = [&](std::shared_ptr<ov::Node> src, int depth) -> std::shared_ptr<ov::Node> {
+                    if (depth == 0) return nullptr;
+                    for (auto& out : src->outputs()) {
+                        for (auto& inp : out.get_target_inputs()) {
+                            auto tgt = inp.get_node()->shared_from_this();
+                            if (ov::is_type<ov::op::v1::Add>(tgt)) return tgt;
+                            auto found = find_add(tgt, depth - 1);
+                            if (found) return found;
+                        }
+                    }
+                    return nullptr;
+                };
+                auto xattn_residual_add = find_add(xattn_node, 4);
+                if (xattn_residual_add) {
+                    auto dbg_xattn_res = std::make_shared<ov::op::v0::Result>(xattn_residual_add->output(0));
+                    std::string res_name = "DEBUG_after_xattn_L" + std::to_string(layer_idx);
+                    dbg_xattn_res->set_friendly_name(res_name);
+                    dbg_xattn_res->get_output_tensor(0).set_names({res_name});
+                    dbg_results.push_back(dbg_xattn_res);
+                    if (cb_verbose()) std::cout << "  [dbg-tap] " << res_name << " → "
+                              << xattn_residual_add->get_friendly_name() << "\n";
+                } else {
+                    if (cb_verbose()) std::cout << "  [dbg-tap] WARNING: cross-attn residual Add not found for layer " << layer_idx << "\n";
+                }
+            }
+            model->add_results(dbg_results);
+            model->validate_nodes_and_infer_types();
+            if (cb_verbose()) std::cout << "  Added " << dbg_results.size() << " per-layer hidden-state debug tap(s).\n";
+        }
+
+        // Debug: dump inferred shapes of q_seq_t and segmented SDPA for the first CA layer.
+        for (const auto& op : model->get_ordered_ops()) {
+            const std::string& n = op->get_friendly_name();
+            if (n.find("layers.0") == std::string::npos) continue;
+            if (n.find("q_seq_t") != std::string::npos || n.find("/seg") != std::string::npos) {
+                if (cb_verbose()) std::cout << "  [shape-dbg] " << n.substr(n.rfind('/')+1) << ":";
+                for (size_t i = 0; i < op->get_input_size(); ++i)
+                    if (cb_verbose()) std::cout << " in" << i << "=" << op->get_input_partial_shape(i);
+                for (size_t i = 0; i < op->get_output_size(); ++i)
+                    if (cb_verbose()) std::cout << " out" << i << "=" << op->get_output_partial_shape(i);
+                if (cb_verbose()) std::cout << "\n";
+            }
+        }
+        if (cb_verbose()) std::cout << "\n";
+    } // end if (!skip_segmented_ca)
+
+    if (cb_verbose()) std::cout << "Selective PA transformation complete!\n\n";
+    return projector_model;
 }
 
 } // namespace
@@ -524,20 +1046,20 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
     // COMMENTED OUT: This breaks existing Reshape nodes in the model that expect 2D input
     // The issue may be in how we set the input tensor, not in the model structure
     /*
-    std::cout << "Continuous Batching Pipeline: Checking for 2D input_ids parameter to reshape to 1D...\n";
-    std::cout << "Model parameters:\n";
+    if (cb_verbose()) std::cout << "Continuous Batching Pipeline: Checking for 2D input_ids parameter to reshape to 1D...\n";
+    if (cb_verbose()) std::cout << "Model parameters:\n";
     for (auto& param : model->get_parameters()) {
         auto shape = param->get_partial_shape();
-        std::cout << "  - " << param->get_friendly_name() << ": shape=" << shape 
+        if (cb_verbose()) std::cout << "  - " << param->get_friendly_name() << ": shape=" << shape 
                   << ", rank=" << (shape.rank().is_static() ? std::to_string(shape.rank().get_length()) : "dynamic") << "\n";
     }
     
     for (auto& param : model->get_parameters()) {
         if (param->get_friendly_name() == "input_ids" || param->get_friendly_name() == "decoder_input_ids") {
             auto shape = param->get_partial_shape();
-            std::cout << "Found " << param->get_friendly_name() << " parameter with shape: " << shape << "\n";
+            if (cb_verbose()) std::cout << "Found " << param->get_friendly_name() << " parameter with shape: " << shape << "\n";
             if (shape.rank().is_static() && shape.rank().get_length() == 2) {
-                std::cout << "Reshaping " << param->get_friendly_name() << " from 2D " << shape << " to 1D {?}\n";
+                if (cb_verbose()) std::cout << "Reshaping " << param->get_friendly_name() << " from 2D " << shape << " to 1D {?}\n";
                 
                 // Find all consumers of this parameter
                 auto consumers = param->output(0).get_target_inputs();
@@ -553,7 +1075,7 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
                         consumer.replace_source_output(reshape->output(0));
                     }
                     
-                    std::cout << "Added Reshape node to flatten input_ids to 1D\n";
+                    if (cb_verbose()) std::cout << "Added Reshape node to flatten input_ids to 1D\n";
                 }
             }
             break;
@@ -564,33 +1086,53 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
     // Check if PA transformation should be skipped entirely for debugging
     const char* skip_pa = std::getenv("SKIP_PA_TRANSFORMATION");
     bool skip_pa_transformation = (skip_pa != nullptr && std::string(skip_pa) == "1");
-    
+
+    // Auto-detect whether this is an encoder-decoder model (Whisper, etc.) by checking
+    // for cross-attention SDPA nodes.  If any are found, use apply_selective_pa_transformation
+    // which handles ReadValue bypass + projector extraction + segmented cross-attention.
+    // PA_SELF_ATTEN_ONLY=1 keeps backward compat; PA_SELF_ATTEN_ONLY=0 forces the full path.
+    bool has_cross_attn = false;
+    for (const auto& op : model->get_ops()) {
+        if (!ov::is_type<ov::op::v13::ScaledDotProductAttention>(op)) continue;
+        const std::string& n = op->get_friendly_name();
+        if (n.find("encoder_attn") != std::string::npos ||
+            n.find("cross_attn")   != std::string::npos) {
+            has_cross_attn = true;
+            break;
+        }
+    }
+
     // Check if selective PA transformation is requested (self-attention only)
     const char* pa_self_attn_only = std::getenv("PA_SELF_ATTEN_ONLY");
-    bool use_selective_pa = (pa_self_attn_only != nullptr && std::string(pa_self_attn_only) == "1");
+    // Auto-enable for encoder-decoder models; env-var can still force either direction.
+    bool use_selective_pa = has_cross_attn;
+    if (pa_self_attn_only != nullptr)
+        use_selective_pa = (std::string(pa_self_attn_only) == "1");
+    if (has_cross_attn)
+        std::cout << "[CB] Encoder-decoder model detected — using selective PA + CrossKVCache path\n";
 
     if (skip_pa_transformation) {
-        std::cout << "SKIP_PA_TRANSFORMATION=1: Skipping PA transformation entirely for debugging\n";
-        std::cout << "WARNING: This means no continuous batching - just testing if PA is the issue\n";
+        if (cb_verbose()) std::cout << "SKIP_PA_TRANSFORMATION=1: Skipping PA transformation entirely for debugging\n";
+        if (cb_verbose()) std::cout << "WARNING: This means no continuous batching - just testing if PA is the issue\n";
     } else if (use_selective_pa) {
-        std::cout << "PA_SELF_ATTEN_ONLY=1 detected: applying selective PA transformation (self-attention only)\n";
-        apply_selective_pa_transformation(model);
+        if (cb_verbose()) std::cout << "Applying selective PA transformation (cross-attn auto-detected or PA_SELF_ATTEN_ONLY=1)\n";
+        m_projector_model = apply_selective_pa_transformation(model);
         utils::apply_gather_before_matmul_transformation(model);
 
                 // Post-process: Remove incorrect Unsqueeze added after decoder_input_ids/input_ids for Whisper
         // The PA transformation incorrectly adds Unsqueeze [?,?] -> [?,1,?] which breaks subsequent Reshape
-        std::cout << "\nPost-processing: Checking for incorrect Unsqueeze after decoder_input_ids...\n";
+        if (cb_verbose()) std::cout << "\nPost-processing: Checking for incorrect Unsqueeze after decoder_input_ids...\n";
         for (auto& param : model->get_parameters()) {
             if (param->get_friendly_name() == "input_ids" || param->get_friendly_name() == "decoder_input_ids") {
                 auto shape = param->get_partial_shape();
-                std::cout << "Found parameter: " << param->get_friendly_name() << " with shape " << shape << "\n";
+                if (cb_verbose()) std::cout << "Found parameter: " << param->get_friendly_name() << " with shape " << shape << "\n";
                 
                 // Check if first consumer is an Unsqueeze
                 auto consumers = param->output(0).get_target_inputs();
                 for (auto& consumer : consumers) {
                     auto consumer_node = consumer.get_node();
                     if (ov::is_type<ov::op::v0::Unsqueeze>(consumer_node)) {
-                        std::cout << "  Found Unsqueeze node: " << consumer_node->get_friendly_name() << "\n";
+                        if (cb_verbose()) std::cout << "  Found Unsqueeze node: " << consumer_node->get_friendly_name() << "\n";
                         
                         // Get the Unsqueeze node's consumers
                         auto unsqueeze_consumers = consumer_node->output(0).get_target_inputs();
@@ -601,24 +1143,24 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
                             auto consumer_op = unsqueeze_consumer.get_node();
                             if (ov::is_type<ov::op::v1::Reshape>(consumer_op)) {
                                 unsqueeze_consumer.replace_source_output(param->output(0));
-                                std::cout << "    Bypassed Unsqueeze for Reshape: " 
+                                if (cb_verbose()) std::cout << "    Bypassed Unsqueeze for Reshape: " 
                                           << consumer_op->get_friendly_name() << "\n";
                             } else {
-                                std::cout << "    Kept Unsqueeze for: " 
+                                if (cb_verbose()) std::cout << "    Kept Unsqueeze for: " 
                                           << consumer_op->get_friendly_name() << " (type: " 
                                           << consumer_op->get_type_name() << ")\n";
                             }
                         }
                         
-                        std::cout << "  Selectively removed Unsqueeze connections for " << param->get_friendly_name() << "\n";
+                        if (cb_verbose()) std::cout << "  Selectively removed Unsqueeze connections for " << param->get_friendly_name() << "\n";
                     }
                 }
             }
         }
-        std::cout << "Post-processing complete.\n\n";
+        if (cb_verbose()) std::cout << "Post-processing complete.\n\n";
 
     } else {
-        std::cout << "Applying full PA transformation (all SDPA nodes)\n";
+        if (cb_verbose()) std::cout << "Applying full PA transformation (all SDPA nodes)\n";
         bool is_need_per_layer_cache_control = scheduler_config.use_cache_eviction;
         bool allow_cache_rotation = scheduler_config.cache_eviction_config.apply_rotation;
         bool allow_xattention = scheduler_config.use_sparse_attention && scheduler_config.sparse_attention_config.mode == SparseAttentionMode::XATTENTION;
@@ -626,9 +1168,9 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
         bool allow_adaptive_rkv = scheduler_config.use_cache_eviction && scheduler_config.cache_eviction_config.aggregation_mode == AggregationMode::ADAPTIVE_RKV;
         auto sdpa_to_pa_successful = ov::pass::SDPAToPagedAttention(is_need_per_layer_cache_control, is_need_per_layer_cache_control, allow_score_aggregation, allow_cache_rotation, allow_xattention, allow_adaptive_rkv).run_on_model(model);
         if (sdpa_to_pa_successful) {
-            std::cout << "SDPA to Paged Attention transformation applied successfully.\n";
+            if (cb_verbose()) std::cout << "SDPA to Paged Attention transformation applied successfully.\n";
         } else {
-            std::cout << "SDPA to Paged Attention transformation was not applied successfully.\n";
+            if (cb_verbose()) std::cout << "SDPA to Paged Attention transformation was not applied successfully.\n";
         }
         utils::apply_gather_before_matmul_transformation(model);
         
@@ -639,66 +1181,66 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
     // Additional post-processing: Fix Reshape constants before PagedAttentionExtension
     // The SDPAToPagedAttention transformation creates Reshape nodes with pattern [1, -1]
     // but for continuous batching we need [-1, hidden_size] to properly flatten batch*seq_len
-    std::cout << "\nPost-processing: Fixing Reshape patterns before PagedAttentionExtension...\n";
+    if (cb_verbose()) std::cout << "\nPost-processing: Fixing Reshape patterns before PagedAttentionExtension...\n";
     for (auto& node : model->get_ordered_ops()) {
         if (node->get_type_name() == std::string("PagedAttentionExtension")) {
-            std::cout << "Found PagedAttentionExtension: " << node->get_friendly_name() << "\n";
+            if (cb_verbose()) std::cout << "Found PagedAttentionExtension: " << node->get_friendly_name() << "\n";
             
             // Check inputs 0, 1, 2 (Q, K, V)
             for (size_t input_idx = 0; input_idx < 3; ++input_idx) {
                 auto input_node = node->get_input_node_shared_ptr(input_idx);
                 if (ov::is_type<ov::op::v1::Reshape>(input_node)) {
-                    std::cout << "  Input " << input_idx << " is Reshape: " << input_node->get_friendly_name() << "\n";
+                    if (cb_verbose()) std::cout << "  Input " << input_idx << " is Reshape: " << input_node->get_friendly_name() << "\n";
                     
                     // Get the reshape pattern (should be second input)
                     auto pattern_node = input_node->get_input_node_shared_ptr(1);
                     if (auto constant = ov::as_type_ptr<ov::op::v0::Constant>(pattern_node)) {
                         auto pattern_data = constant->cast_vector<int64_t>();
-                        std::cout << "    Current pattern: [";
+                        if (cb_verbose()) std::cout << "    Current pattern: [";
                         for (size_t i = 0; i < pattern_data.size(); ++i) {
-                            std::cout << pattern_data[i];
+                            if (cb_verbose()) std::cout << pattern_data[i];
                             if (i < pattern_data.size() - 1) std::cout << ", ";
                         }
-                        std::cout << "]\n";
+                        if (cb_verbose()) std::cout << "]\n";
                         
                         // Debug: print each element
-                        std::cout << "    Pattern analysis: size=" << pattern_data.size();
+                        if (cb_verbose()) std::cout << "    Pattern analysis: size=" << pattern_data.size();
                         if (pattern_data.size() >= 1) std::cout << ", [0]=" << pattern_data[0];
                         if (pattern_data.size() >= 2) std::cout << ", [1]=" << pattern_data[1];
-                        std::cout << "\n";
+                        if (cb_verbose()) std::cout << "\n";
                         
                         // If pattern is [0, -1] or [1, -1], change to [-1, hidden_size]
                         // [0, -1] means "copy first dim from input, infer second" which is wrong for PA
                         bool needs_fix = (pattern_data.size() == 2 && 
                                          (pattern_data[0] == 0 || pattern_data[0] == 1) && 
                                          pattern_data[1] == -1);
-                        std::cout << "    Pattern needs_fix: " << (needs_fix ? "YES" : "NO") << "\n";
+                        if (cb_verbose()) std::cout << "    Pattern needs_fix: " << (needs_fix ? "YES" : "NO") << "\n";
                         
                         if (needs_fix) {
-                            std::cout << "    Pattern needs fixing: [" << pattern_data[0] << ", -1] -> [-1, hidden_size]\n";
+                            if (cb_verbose()) std::cout << "    Pattern needs fixing: [" << pattern_data[0] << ", -1] -> [-1, hidden_size]\n";
                             
                             // Get the input shape to Reshape to determine hidden_size
                             auto reshape_input_shape = input_node->get_input_partial_shape(0);
-                            std::cout << "    Reshape input shape: " << reshape_input_shape << "\n";
-                            std::cout << "    Reshape input rank: " << reshape_input_shape.rank() << "\n";
+                            if (cb_verbose()) std::cout << "    Reshape input shape: " << reshape_input_shape << "\n";
+                            if (cb_verbose()) std::cout << "    Reshape input rank: " << reshape_input_shape.rank() << "\n";
                             
                             // For shape [batch, seq, num_heads, head_dim] or [?, ?, num_heads, head_dim]
                             // hidden_size = num_heads * head_dim (should be static even if batch/seq are dynamic)
                             int64_t hidden_size = -1;
                             if (reshape_input_shape.rank().is_static() && reshape_input_shape.rank().get_length() == 4) {
-                                std::cout << "    Reshape input is 4D\n";
+                                if (cb_verbose()) std::cout << "    Reshape input is 4D\n";
                                 auto num_heads_dim = reshape_input_shape[2];
                                 auto head_dim = reshape_input_shape[3];
-                                std::cout << "    num_heads_dim: " << num_heads_dim << ", head_dim: " << head_dim << "\n";
+                                if (cb_verbose()) std::cout << "    num_heads_dim: " << num_heads_dim << ", head_dim: " << head_dim << "\n";
                                 
                                 if (num_heads_dim.is_static() && head_dim.is_static()) {
                                     hidden_size = num_heads_dim.get_length() * head_dim.get_length();
-                                    std::cout << "    Computed hidden_size: " << hidden_size << "\n";
+                                    if (cb_verbose()) std::cout << "    Computed hidden_size: " << hidden_size << "\n";
                                 } else {
-                                    std::cout << "    ERROR: num_heads or head_dim is dynamic\n";
+                                    if (cb_verbose()) std::cout << "    ERROR: num_heads or head_dim is dynamic\n";
                                 }
                             } else {
-                                std::cout << "    ERROR: Reshape input is not 4D or rank is dynamic\n";
+                                if (cb_verbose()) std::cout << "    ERROR: Reshape input is not 4D or rank is dynamic\n";
                             }
                             
                             // If we couldn't compute hidden_size, try hardcoded value for Whisper
@@ -709,7 +1251,7 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
                                     auto num_heads_dim = reshape_input_shape[2];
                                     if (num_heads_dim.is_static() && num_heads_dim.get_length() == 20) {
                                         hidden_size = 1280;
-                                        std::cout << "    Using hardcoded hidden_size for Whisper: " << hidden_size << "\n";
+                                        if (cb_verbose()) std::cout << "    Using hardcoded hidden_size for Whisper: " << hidden_size << "\n";
                                     }
                                 }
                             }
@@ -729,121 +1271,144 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
                                     auto verify_node = input_node->get_input_node_shared_ptr(1);
                                     if (auto verify_constant = ov::as_type_ptr<ov::op::v0::Constant>(verify_node)) {
                                         auto verify_pattern = verify_constant->cast_vector<int64_t>();
-                                        std::cout << "    VERIFIED - New pattern: [";
+                                        if (cb_verbose()) std::cout << "    VERIFIED - New pattern: [";
                                         for (size_t i = 0; i < verify_pattern.size(); ++i) {
-                                            std::cout << verify_pattern[i];
+                                            if (cb_verbose()) std::cout << verify_pattern[i];
                                             if (i < verify_pattern.size() - 1) std::cout << ", ";
                                         }
-                                        std::cout << "]\n";
+                                        if (cb_verbose()) std::cout << "]\n";
                                     }
                                     
-                                    std::cout << "    Fixed pattern: [-1, " << hidden_size << "]\n";
+                                    if (cb_verbose()) std::cout << "    Fixed pattern: [-1, " << hidden_size << "]\n";
                             } else {
-                                std::cout << "    ERROR: Could not determine hidden_size for shape " << reshape_input_shape << "\n";
+                                if (cb_verbose()) std::cout << "    ERROR: Could not determine hidden_size for shape " << reshape_input_shape << "\n";
                             }
                         } else {
-                            std::cout << "    Pattern does not need fixing\n";
+                            if (cb_verbose()) std::cout << "    Pattern does not need fixing\n";
                         }
                     }
                 }
             }
         }
     }
-    std::cout << "Input Reshape pattern fixes complete.\n\n";
-    
-    // Fix OUTPUT Reshapes from PagedAttentionExtension
-    // Pattern is typically [0, 1, -1, head_dim] via Concat, but should be [1, -1, num_heads, head_dim]
-    std::cout << "Fixing OUTPUT Reshapes from PagedAttentionExtension...\n";
-    for (auto& node : model->get_ordered_ops()) {
-        if (node->get_type_name() == std::string("PagedAttentionExtension")) {
-            std::cout << "Checking outputs of PA: " << node->get_friendly_name() << "\n";
-            
-            // Check all consumers of this PA node
-            for (auto& output : node->outputs()) {
-                for (auto& input : output.get_target_inputs()) {
-                    auto consumer = input.get_node()->shared_from_this();
-                    
-                    if (ov::is_type<ov::op::v1::Reshape>(consumer)) {
-                        std::cout << "  OUTPUT to Reshape: " << consumer->get_friendly_name() << "\n";
-                        
-                        // Get the reshape pattern source (usually a Concat node)
-                        auto pattern_node = consumer->get_input_node_shared_ptr(1);
-                        
-                        if (ov::is_type<ov::op::v0::Concat>(pattern_node)) {
-                            std::cout << "    Pattern from Concat node: " << pattern_node->get_friendly_name() << "\n";
-                            
-                            // The Concat typically combines [batch, seq, num_heads, head_dim]
-                            // Pattern [0, 1, -1, head_dim] is wrong - should be [1, -1, num_heads, head_dim]
-                            // We need to replace:
-                            // - Input 0: Change constant '0' to '1' (force batch=1 instead of copy)
-                            // - Input 1: Change constant '1' to '-1' (infer seq_len instead of static 1)
-                            // - Input 2: Change constant '-1' to '20' (explicit num_heads for Whisper)
-                            
-                            for (size_t concat_input = 0; concat_input < pattern_node->get_input_size(); ++concat_input) {
-                                auto concat_input_node = pattern_node->get_input_node_shared_ptr(concat_input);
-                                
-                                if (auto constant = ov::as_type_ptr<ov::op::v0::Constant>(concat_input_node)) {
-                                    auto values = constant->cast_vector<int64_t>();
-                                    if (values.size() == 1) {
-                                        int64_t val = values[0];
-                                        std::cout << "      Concat input " << concat_input << ": " << val;
-                                        
-                                        // Fix input 0: change 0 (copy) to 1 (static batch)
-                                        if (concat_input == 0 && val == 0) {
-                                            auto new_constant = std::make_shared<ov::op::v0::Constant>(
-                                                ov::element::i64, ov::Shape{1}, std::vector<int64_t>{1});
-                                            pattern_node->input(concat_input).replace_source_output(new_constant->output(0));
-                                            std::cout << " -> 1 (FIXED: force batch=1)\n";
-                                        }
-                                        // Fix input 1: change 1 (static) to -1 (infer seq_len)
-                                        else if (concat_input == 1 && val == 1) {
-                                            auto new_constant = std::make_shared<ov::op::v0::Constant>(
-                                                ov::element::i64, ov::Shape{1}, std::vector<int64_t>{-1});
-                                            pattern_node->input(concat_input).replace_source_output(new_constant->output(0));
-                                            std::cout << " -> -1 (FIXED: infer seq_len)\n";
-                                        }
-                                        // Fix input 2: change -1 (infer) to 20 (explicit num_heads)
-                                        else if (concat_input == 2 && val == -1) {
-                                            auto new_constant = std::make_shared<ov::op::v0::Constant>(
-                                                ov::element::i64, ov::Shape{1}, std::vector<int64_t>{20});
-                                            pattern_node->input(concat_input).replace_source_output(new_constant->output(0));
-                                            std::cout << " -> 20 (FIXED: explicit num_heads)\n";
-                                        }
-                                        else {
-                                            std::cout << " (unchanged)\n";
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            std::cout << "    Pattern is not a Concat, skipping\n";
-                        }
-                    }
-                }
-            }
-        }
-    }
-    std::cout << "Output Reshape fixes complete.\n\n";
-    
+    if (cb_verbose()) std::cout << "Input Reshape pattern fixes complete.\n\n";
+
     // Revalidate the model after all modifications
-    std::cout << "Revalidating model after all transformations...\n";
+    if (cb_verbose()) std::cout << "Revalidating model after all transformations...\n";
     model->validate_nodes_and_infer_types();
-    std::cout << "Model validation complete.\n\n";
-    
-    // Verify final parameter shapes
-    std::cout << "Final parameter shapes after all modifications:\n";
-    for (auto& param : model->get_parameters()) {
-        std::cout << "  " << param->get_friendly_name() << ": " << param->get_partial_shape() << "\n";
+    if (cb_verbose()) std::cout << "Model validation complete.\n\n";
+
+    // Post-processing: bypass the head-unsplit Reshape/Transpose chain left by
+    // SDPAToPagedAttention after each self-attention PA output.
+    //
+    // SDPAToPagedAttention replaces the SDPA node with a PA node but leaves the
+    // original post-SDPA chain in place:
+    //   SDPA [bs,n_heads,T,head_dim] → Transpose → Transpose_3 → Reshape(0,0,H)
+    // Wired to PA output it becomes:
+    //   PA [N,H] → Reshape(head-unsplit) → Transpose → Transpose_3 → Reshape(0,0,H) → out_proj
+    //
+    // The final Reshape(0,0,H) uses special_zero=true so dim0 and dim1 come from the
+    // input tensor.  Its input is shape [1,1,N,64] (from the Transpose chain), so it
+    // always produces [1,1,H] — collapsing N tokens to 1.  At N=1 that accidentally
+    // matches the residual [1,1,H]; at N>1 the residual is [1,N,H] and the Add fails.
+    //
+    // Fix: replace the entire Reshape/Transpose/Transpose/Reshape chain with a single
+    // Reshape [N,H] → [1,-1,H].  "Walk" from PA output through consecutive Reshape and
+    // Transpose nodes; redirect the FIRST non-Reshape/Transpose consumer (i.e. the
+    // out_proj MatMul) to receive the new [1,-1,H] tensor instead.
+    //
+    // All remaining PA nodes are self-attention (cross-attention was restored to SDPA).
+    {
+        if (cb_verbose()) std::cout << "Post-processing: Bypassing PA post-SDPA head-unsplit chain...\n";
+        auto ops_for_bypass = model->get_ordered_ops();
+        int bypass_count = 0;
+        for (const auto& op : ops_for_bypass) {
+            if (op->get_type_info().name != std::string("PagedAttentionExtension")) continue;
+
+            // H is statically known from the PA output partial shape.
+            auto pa_out_shape = op->output(0).get_partial_shape();
+            int64_t H_static = -1;
+            if (pa_out_shape.rank().is_static() && pa_out_shape.rank().get_length() >= 2) {
+                auto H_dim = pa_out_shape[pa_out_shape.rank().get_length() - 1];
+                if (H_dim.is_static()) H_static = static_cast<int64_t>(H_dim.get_length());
+            }
+            if (H_static <= 0) {
+                if (cb_verbose()) std::cout << "  Skipping (H unknown): " << op->get_friendly_name() << "\n";
+                continue;
+            }
+
+            // Walk from PA output through Reshape/Transpose nodes to find the first
+            // non-Reshape/Transpose consumer (the out_proj MatMul or equivalent).
+            // Collect all Reshape/Transpose nodes in the chain so we can transfer names.
+            //
+            // Only follow single-consumer chains to avoid splitting the graph incorrectly.
+            ov::Output<ov::Node> cursor = op->output(0);
+            std::string chain_last_name;
+            bool found_chain = false;
+            for (int depth = 0; depth < 8; ++depth) {
+                auto consumers = cursor.get_target_inputs();
+                if (consumers.size() != 1) break;  // multiple consumers — stop
+                auto next = consumers.begin()->get_node()->shared_from_this();
+                const std::string& t = next->get_type_info().name;
+                if (t != std::string("Reshape") && t != std::string("Transpose")) {
+                    // next is the out_proj MatMul (or first non-chain node)
+                    found_chain = true;
+                    break;
+                }
+                chain_last_name = next->get_friendly_name();
+                cursor = next->output(0);
+            }
+
+            if (!found_chain) {
+                if (cb_verbose()) std::cout << "  No chain found for: " << op->get_friendly_name() << "\n";
+                continue;
+            }
+
+            // cursor is now the output of the last Reshape/Transpose in the chain.
+            // All its consumers should be redirected to the new unflatten output.
+            auto unflatten_shape = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3},
+                                                                 std::vector<int64_t>{1, -1, H_static});
+            auto unflatten = std::make_shared<ov::op::v1::Reshape>(
+                op->output(0), unflatten_shape->output(0), /*special_zero=*/false);
+            unflatten->set_friendly_name(op->get_friendly_name() + "/out_unflatten");
+
+            // Transfer tensor names from the chain tail so downstream references resolve.
+            unflatten->output(0).get_tensor().set_names(cursor.get_tensor().get_names());
+            cursor.get_tensor().set_names({});
+
+            // Collect consumers of chain tail BEFORE redirect.
+            std::vector<ov::Input<ov::Node>> targets;
+            for (auto& tgt : cursor.get_target_inputs())
+                targets.push_back(tgt);
+            for (auto& tgt : targets)
+                tgt.replace_source_output(unflatten->output(0));
+
+            if (cb_verbose()) std::cout << "  Bypassed chain → unflatten after PA: "
+                      << op->get_friendly_name()
+                      << "  [N," << H_static << "] → [1,N," << H_static << "]"
+                      << "  (chain tail: " << chain_last_name << ")\n";
+            ++bypass_count;
+        }
+        if (cb_verbose()) std::cout << "  Bypassed " << bypass_count << " PA head-unsplit chain(s).\n\n";
     }
-    std::cout << "\n";
+
+    // Revalidate after bypass insertions
+    model->validate_nodes_and_infer_types();
+
+    // Verify final parameter shapes
+    if (cb_verbose()) std::cout << "Final parameter shapes after all modifications:\n";
+    for (auto& param : model->get_parameters()) {
+        if (cb_verbose()) std::cout << "  " << param->get_friendly_name() << ": " << param->get_partial_shape() << "\n";
+    }
+    if (cb_verbose()) std::cout << "\n";
 
     // Save the transformed model to XML for debugging
-    std::cout << "Saving transformed model to pa_experimental_model.xml...\n";
+    if (cb_verbose()) std::cout << "Saving transformed model to pa_experimental_model.xml...\n";
     try {
         ov::pass::Serialize("./pa_experimental_model.xml", "./pa_experimental_model.bin").run_on_model(model);
-        std::cout << "Model saved successfully!\n\n";
+        if (cb_verbose()) std::cout << "Model saved successfully!\n\n";
     } catch (const std::exception& e) {
-        std::cout << "Failed to save model: " << e.what() << "\n\n";
+        if (cb_verbose()) std::cout << "Failed to save model: " << e.what() << "\n\n";
     }
 
     initialize_pipeline(model, scheduler_config, device, properties);
@@ -881,6 +1446,25 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(
 }
 
 ContinuousBatchingPipeline::ContinuousBatchingImpl::~ContinuousBatchingImpl() {
+    // Free any still-allocated KV-cache blocks before the block-manager is destroyed.
+    // This prevents the BlockManager destructor assertion (m_block_table.empty()) from
+    // firing when sequences are in-flight at shutdown (e.g. incomplete generation, exception, etc.)
+    if (m_scheduler) {
+        try {
+            _pull_awaiting_requests();
+        } catch (...) {}
+        for (const auto& request : m_requests) {
+            for (const auto& sequence : request->get_sequences()) {
+                try {
+                    if (m_scheduler->has_block_table(sequence->get_id())) {
+                        m_scheduler->free_sequence(sequence->get_id());
+                    }
+                } catch (...) {}
+            }
+        }
+        m_requests.clear();
+    }
+
     // manually release all blocks, which can re-initialize OpenVINO plugins during destruction
     if (m_model_runner) {
         m_model_runner->get_infer_request().get_compiled_model().release_memory();
@@ -919,13 +1503,50 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(
     }
 
     // Debug: print all model input names just before compile - this shows what set_tensor names are valid
-    std::cout << "=== MODEL INPUTS BEFORE COMPILE ===\n";
+    if (cb_verbose()) std::cout << "=== MODEL INPUTS BEFORE COMPILE ===\n";
     for (const auto& input : model->inputs()) {
-        std::cout << "  INPUT: ";
+        if (cb_verbose()) std::cout << "  INPUT: ";
         for (const auto& name : input.get_names()) std::cout << "'" << name << "' ";
-        std::cout << "  shape=" << input.get_partial_shape() << "\n";
+        if (cb_verbose()) std::cout << "  shape=" << input.get_partial_shape() << "\n";
     }
-    std::cout << "===================================\n\n";
+    if (cb_verbose()) std::cout << "===================================\n\n";
+
+    // Audit: enumerate dynamic-output Reshape nodes just before compile.
+    // With cb_verbose(), print every dynamic/suspicious Reshape and trace
+    // the shape-input chain for any Reshape with "229018" in its name.
+    {
+        int reshape_total = 0, reshape_dynamic = 0;
+        for (const auto& op : model->get_ordered_ops()) {
+            if (!ov::is_type<ov::op::v1::Reshape>(op)) continue;
+            ++reshape_total;
+            const auto& out_ps = op->get_output_partial_shape(0);
+            const bool is_static = out_ps.rank().is_static() && out_ps.is_static();
+            if (is_static) continue;
+            ++reshape_dynamic;
+            const std::string& name = op->get_friendly_name();
+            const bool is_229018 = name.find("229018") != std::string::npos;
+            if (cb_verbose() || is_229018) {
+                std::cout << "[DecoderAudit] Reshape '" << name
+                          << "'  out_shape=" << out_ps
+                          << (is_229018 ? "  <<< FOUND 229018" : "") << "\n";
+            }
+            if (is_229018) {
+                for (size_t pi = 0; pi < op->get_input_size(); ++pi) {
+                    auto src = op->input(pi).get_source_output();
+                    std::cout << "  [229018]  input[" << pi << "] from '"
+                              << src.get_node()->get_friendly_name()
+                              << "' idx=" << src.get_index()
+                              << "  shape=" << src.get_partial_shape() << "\n";
+                }
+                for (const auto& tgt : op->output(0).get_target_inputs())
+                    std::cout << "  [229018]  consumed by '"
+                              << tgt.get_node()->get_friendly_name()
+                              << "' port=" << tgt.get_index() << "\n";
+            }
+        }
+        std::cout << "[DecoderAudit] Reshape nodes: " << reshape_total
+                  << " total, " << reshape_dynamic << " dynamic-output\n";
+    }
 
     ov::CompiledModel compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
     std::vector<std::string> execution_devices = compiled_model.get_property(ov::execution_devices);
@@ -1002,6 +1623,27 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(
                                                        /* is_aggregate_attention_scores = */ false,
                                                        is_use_xattention,
                                                        /* is_use_adaptive_rkv = */ false);
+    }
+
+    // ---- Cross-attention K/V slot cache (Option A) ----
+    // Compile the projector model extracted by apply_selective_pa_transformation() and
+    // instantiate a CrossKVCache so every admitted request runs K/V projection once.
+    if (m_projector_model) {
+        const char* kv_env = std::getenv("CROSS_KV_CACHE");
+        const bool cross_kv_enabled = !(kv_env && std::string(kv_env) == "0");
+        if (cross_kv_enabled) {
+            // Compile projector and stash the InferRequest.
+            // CrossKVCache is constructed lazily on the first admit() call once we have
+            // a real encoder_hidden_state and can read concrete output shapes.
+            if (cb_verbose()) std::cout << "[CrossKV] Compiling projector model...\n";
+            ov::CompiledModel proj_compiled =
+                utils::singleton_core().compile_model(m_projector_model, device, *filtered_properties);
+            m_proj_infer_request = proj_compiled.create_infer_request();
+            std::cout << "[CrossKV] Projector compiled — CrossKVCache will be initialised on first request\n";
+        } else {
+            std::cout << "[CrossKV] CROSS_KV_CACHE=0 — running without slot cache (slow path)\n";
+            m_projector_model = nullptr;  // disable fast path gate
+        }
     }
 
     m_sampler = std::make_shared<Sampler>(m_tokenizer, sampler_num_threads);
@@ -1081,17 +1723,18 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request(
     }
     else {
         if (encoder_hidden_state.has_value()) {
-            std::cout << "Creating SequenceGroup with encoder_hidden_state\n";
-            std::cout << "  encoder_hidden_state shape: [";
-            for (size_t i = 0; i < encoder_hidden_state->get_shape().size(); ++i) {
-                std::cout << encoder_hidden_state->get_shape()[i];
-                if (i < encoder_hidden_state->get_shape().size() - 1) std::cout << ", ";
+            if (cb_verbose()) {
+                std::cout << "Creating SequenceGroup with encoder_hidden_state\n";
+                std::cout << "  encoder_hidden_state shape: [";
+                for (size_t i = 0; i < encoder_hidden_state->get_shape().size(); ++i) {
+                    std::cout << encoder_hidden_state->get_shape()[i];
+                    if (i < encoder_hidden_state->get_shape().size() - 1) std::cout << ", ";
+                }
+                std::cout << "], size: " << encoder_hidden_state->get_size() << "\n";
             }
-            std::cout << "], size: " << encoder_hidden_state->get_size() << "\n";
-            
             sequence_group = std::make_shared<SequenceGroup>(request_id, input_ids, *encoder_hidden_state, sampling_params_copy, m_block_size);
         } else {
-            std::cout << "Creating SequenceGroup WITHOUT encoder_hidden_state\n";
+            if (cb_verbose()) std::cout << "Creating SequenceGroup WITHOUT encoder_hidden_state\n";
             sequence_group = std::make_shared<SequenceGroup>(request_id, input_ids, sampling_params_copy, m_block_size, token_type_ids);
         }    
     }
@@ -1100,11 +1743,74 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request(
         m_scheduler->restore_cached_blocks(sequence_group);
     }
 
-    {
-        std::lock_guard<std::mutex> lock{m_awaiting_requests_mutex};
-        m_awaiting_requests.push_back(sequence_group);
+    // Cross-KV slot admission: run projector once per request so K/V for every
+    // cross-attention layer is cached before the first decode step fires.
+    if (encoder_hidden_state.has_value() && m_projector_model) {
+        // Lazy init of CrossKVCache on first admit(): run projector once with a real
+        // encoder_hidden_state so we can read concrete output shapes (T_enc, n_heads,
+        // head_dim) from the actual inferred tensors — avoids relying on OV partial shape
+        // propagation which leaves all dims dynamic in this graph.
+        if (!m_cross_kv_cache) {
+            m_proj_infer_request.set_tensor("encoder_hidden_states", *encoder_hidden_state);
+            m_proj_infer_request.infer();
+
+            // Read concrete geometry from layer-0 K output
+            ov::Tensor K0 = m_proj_infer_request.get_tensor("cross_proj_K_0");
+            const auto& K0_shape = K0.get_shape();
+            OPENVINO_ASSERT(K0_shape.size() == 4,
+                "cross_proj_K_0 must be rank-4 [1, n_heads, T_enc, head_dim]");
+            const size_t n_heads  = K0_shape[1];
+            const size_t T_enc    = K0_shape[2];
+            const size_t head_dim = K0_shape[3];
+            ov::element::Type elem_type = K0.get_element_type();
+
+            // Count layers: projector has cross_proj_K_l + cross_proj_V_l per layer
+            const size_t n_layers = m_proj_infer_request.get_compiled_model().outputs().size() / 2;
+
+            size_t max_slots = 16;
+            const char* env_slots = std::getenv("CROSS_KV_MAX_SLOTS");
+            if (env_slots) max_slots = static_cast<size_t>(std::atoi(env_slots));
+
+            m_cross_kv_cache = std::make_unique<CrossKVCache>(
+                m_proj_infer_request, max_slots,
+                n_layers, n_heads, T_enc, head_dim, elem_type);
+            m_model_runner->set_cross_kv_cache(m_cross_kv_cache.get());
+
+            std::cout << "[CrossKV] Slot cache initialised: max_slots=" << max_slots
+                      << " layers=" << n_layers << " heads=" << n_heads
+                      << " T_enc=" << T_enc << " head_dim=" << head_dim << "\n";
+
+            // Slot 0 is already projected from the infer() above — write it directly
+            // into the buffer rather than re-running infer() inside admit().
+            m_cross_kv_cache->admit_precomputed(request_id, m_proj_infer_request);
+            sequence_group->set_cross_kv_slot_id(m_cross_kv_cache->slot_of(request_id));
+            {
+                std::lock_guard<std::mutex> lock{m_awaiting_requests_mutex};
+                m_awaiting_requests.push_back(sequence_group);
+            }
+            std::cout << "[request " << request_id << "] added, prompt_len=" << prompt_len << "\n";
+        } else {
+            // Admit asynchronously: admit() may block waiting for a free slot.
+            // Running it on the pipeline thread would deadlock (release() is also
+            // called from the pipeline step loop on this same thread).
+            ov::Tensor enc_hs_copy = *encoder_hidden_state;  // ref-counted shallow copy
+            std::thread([this, request_id, enc_hs_copy, sequence_group]() mutable {
+                m_cross_kv_cache->admit(request_id, enc_hs_copy);
+                sequence_group->set_cross_kv_slot_id(m_cross_kv_cache->slot_of(request_id));
+                {
+                    std::lock_guard<std::mutex> lock{m_awaiting_requests_mutex};
+                    m_awaiting_requests.push_back(sequence_group);
+                }
+                std::cout << "[request " << request_id << "] admitted + queued (async)\n";
+            }).detach();
+        }
+    } else {
+        {
+            std::lock_guard<std::mutex> lock{m_awaiting_requests_mutex};
+            m_awaiting_requests.push_back(sequence_group);
+        }
+        std::cout << "[request " << request_id << "] added, prompt_len=" << prompt_len << "\n";
     }
-    std::cout << "Added request " << request_id << " with prompt length " << prompt_len << "\n";
     return std::make_shared<GenerationHandleImpl>(sequence_group->get_generation_stream(), sampling_params_copy);
 }
 
@@ -1134,7 +1840,7 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request(uint64_t request
                                  const ov::Tensor& input_ids,
                                  const ov::Tensor& encoder_hidden_state,
                                  const ov::genai::WhisperGenerationConfig& sampling_params) {
-    std::cout << "ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request with encoder_hidden_state called\n";
+    if (cb_verbose()) std::cout << "ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request with encoder_hidden_state called\n";
     // WhisperGenerationConfig inherits from GenerationConfig, so we can pass it directly
     return add_request(request_id, input_ids, sampling_params, std::nullopt, encoder_hidden_state);
 }
@@ -1146,6 +1852,7 @@ bool ContinuousBatchingPipeline::ContinuousBatchingImpl::has_non_finished_reques
 
 void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
     static ManualTimer step_timer("step()");
+    static size_t step_idx = 0;
     step_timer.start();
 
     _pull_awaiting_requests();
@@ -1187,16 +1894,183 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
         _free_non_running_requests();
         return;
     }
+
+    // Always-visible per-step summary
+    std::cout << "[step " << step_idx++ << "] "
+              << scheduler_output.m_scheduled_sequence_groups_ids.size() << " req(s), "
+              << scheduler_output.m_total_num_scheduled_tokens << " token(s)\n";
+
     ov::Tensor logits;
 
     {
         static ManualTimer timer("forward");
         const auto infer_start = std::chrono::steady_clock::now();
         timer.start();
-        logits = m_model_runner->forward(m_requests, scheduler_output);
+
+        // Three-way split: PROMPT / TRANSITION / GENERATE forward() passes.
+        //
+        // Phase definitions (context_len = processed + scheduled, prompt_len = #SOT tokens):
+        //   PROMPT     – !requires_sampling()              (context_len < prompt_len)
+        //   TRANSITION – requires_sampling() && !can_generate_tokens()  (context_len == prompt_len,
+        //                  processing the last SOT token; produces the first generated token)
+        //   GENERATE   – can_generate_tokens()             (context_len > prompt_len)
+        //
+        // Root causes for mixing phases in one forward():
+        //   1. PROMPT + GENERATE/TRANSITION: sampler offset corruption + KV contamination.
+        //      PROMPT groups have output_seq_len=0 so the sampler offset logic is wrong when
+        //      they remain is_scheduled()==true.  PagedAttention also writes fresh PROMPT KV
+        //      entries while simultaneously reading stale GENERATE KV entries in the same batch.
+        //   2. TRANSITION + GENERATE: TRANSITION computes its first token logit in a batch
+        //      that includes GENERATE queries.  Those GENERATE queries have accumulated KV
+        //      context from prior generation steps; TRANSITION has not.  The segmented
+        //      cross-attention and self-attention interact over an inconsistent KV context,
+        //      corrupting the TRANSITION group's first-token logit (wrong text tokens or
+        //      hallucinated timestamp-repeat loops).
+        //
+        // Solution: three separate forward() passes, one per phase.
+        //   Pass 1 (PROMPT):     write KV, discard logits, finish_iteration() immediately.
+        //   Pass 2 (TRANSITION): solo forward, deep-copy logits (forward() returns a VIEW
+        //                        into the infer-request buffer; Pass 3 would alias it).
+        //   Pass 3 (GENERATE):   solo forward, use logits directly (last forward call).
+        //
+        // After Passes 2+3, logit rows are assembled into one tensor in ascending sg_id
+        // order (= sampler iteration order over m_requests) using byte-accurate memcpy
+        // keyed on elem_type.size() so both f32 and bf16 models are handled correctly.
+        std::vector<uint64_t> prompt_ids, trans_ids, gen_ids;
+        for (uint64_t sg_id : scheduler_output.m_scheduled_sequence_groups_ids) {
+            auto& sg = m_requests[sg_id];
+            if      (!sg->requires_sampling())   prompt_ids.push_back(sg_id);
+            else if (!sg->can_generate_tokens()) trans_ids.push_back(sg_id);
+            else                                 gen_ids.push_back(sg_id);
+        }
+        const bool has_prompt = !prompt_ids.empty();
+        const bool has_trans  = !trans_ids.empty();
+        const bool has_gen    = !gen_ids.empty();
+
+        if (cb_verbose()) std::cout << "[THREE_SPLIT] prompt=" << prompt_ids.size()
+                                     << " trans=" << trans_ids.size()
+                                     << " gen=" << gen_ids.size() << "\n";
+
+        // Helper: build a sub-Scheduler::Output restricted to the given group IDs.
+        auto make_sub_sched = [&](const std::vector<uint64_t>& ids) {
+            Scheduler::Output sub = scheduler_output;
+            sub.m_scheduled_sequence_groups_ids = ids;
+            sub.m_total_num_scheduled_tokens = 0;
+            for (uint64_t id : ids)
+                sub.m_total_num_scheduled_tokens +=
+                    m_requests[id]->get_num_scheduled_tokens() * m_requests[id]->num_running_seqs();
+            return sub;
+        };
+
+        // needs_any_split: true when any two different phases are co-scheduled,
+        // OR (for encoder-decoder / Whisper) when PROMPT groups have different past_lens.
+        //
+        // Whisper-specific PROMPT-solo rule:
+        //   The PagedAttention kernel with N>1 PROMPT sequences is reliable only when all
+        //   sequences have the same past_len (i.e. were injected at the same step and have
+        //   advanced in lockstep).  When past_lens differ (e.g. [1,0] from staggered
+        //   injection) the self-attention write for the later-context sequence goes to a
+        //   wrong physical KV slot, corrupting all future generation for that request.
+        //   Scenario 2 (A@0+B@0) passes because past_lens are always symmetric;
+        //   scenario 3 (A@0+B@1) fails at the first P+P step where past_lens=[1,0].
+        //   Fix: run each PROMPT group with a unique past_len in its own solo pass.
+        bool prompt_needs_solo = false;
+        if (m_has_whisper_config && prompt_ids.size() > 1) {
+            size_t ref_past = m_requests[prompt_ids[0]]->get_num_processed_tokens();
+            for (size_t pi = 1; pi < prompt_ids.size(); ++pi) {
+                if (m_requests[prompt_ids[pi]]->get_num_processed_tokens() != ref_past) {
+                    prompt_needs_solo = true;
+                    break;
+                }
+            }
+        }
+
+        // TRANSITION sequences (last SOT token → first generated token) are safe to batch
+        // with GENERATE sequences: PA handles heterogeneous past_lens by design, and the
+        // cross-attention slot assignment is per-request regardless of decode position.
+        // Merging eliminates one solo forward() per request entering the GENERATE pool.
+        // Separation is only required between PROMPT and non-PROMPT (sampler offset + KV
+        // write/read ordering) and between staggered PROMPT groups (Whisper past_len rule).
+        const bool needs_any_split = (has_prompt && (has_trans || has_gen))
+                                      || prompt_needs_solo;
+
+        // Helper: record last model-runner timings into cumulative pipeline metrics.
+        auto accum_runner_timings = [&]() {
+            auto lt = m_model_runner->get_last_timings();
+            m_pipeline_metrics.cross_attn_assembly_us_total += lt.assembly_us;
+            m_pipeline_metrics.ov_infer_us_total            += lt.infer_us;
+        };
+
+        if (needs_any_split) {
+            // ── Pass 1: PROMPT ─────────────────────────────────────────────────
+            // For Whisper with mixed-past_len PROMPT groups, run each solo to avoid
+            // PA kernel corruption.  For symmetric groups (same past_len, e.g. scenario 2)
+            // or non-Whisper models, batch them together in one pass as before.
+            if (has_prompt) {
+                const auto t_p0 = std::chrono::steady_clock::now();
+                if (prompt_needs_solo) {
+                    for (uint64_t sg_id : prompt_ids) {
+                        m_model_runner->forward(m_requests, make_sub_sched({sg_id}));
+                        accum_runner_timings();
+                        m_requests[sg_id]->finish_iteration();
+                    }
+                } else {
+                    m_model_runner->forward(m_requests, make_sub_sched(prompt_ids));
+                    accum_runner_timings();
+                    for (uint64_t sg_id : prompt_ids)
+                        m_requests[sg_id]->finish_iteration();
+                }
+                m_pipeline_metrics.prompt_phase_us_total += std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - t_p0).count();
+            }
+
+            // ── Pass 2: TRANSITION + GENERATE (batched together) ─────────────
+            // Both phases produce one logit row per sequence; PA handles heterogeneous
+            // past_lens by design.  Batching them eliminates one forward() call per
+            // request that transitions from prompt processing into decode.
+            std::vector<uint64_t> non_prompt_ids;
+            non_prompt_ids.reserve(trans_ids.size() + gen_ids.size());
+            for (uint64_t sg_id : scheduler_output.m_scheduled_sequence_groups_ids)
+                if (m_requests[sg_id]->requires_sampling())
+                    non_prompt_ids.push_back(sg_id);
+
+            if (!non_prompt_ids.empty()) {
+                const auto t_g0 = std::chrono::steady_clock::now();
+                logits = m_model_runner->forward(m_requests, make_sub_sched(non_prompt_ids));
+                accum_runner_timings();
+                const double dt_us = std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - t_g0).count();
+                // All time goes to GENERATE; TRANSITION is now batched with it
+                // and is no longer a separately-reported phase.
+                m_pipeline_metrics.generate_phase_us_total += dt_us;
+            }
+
+            // Update scheduler_output so the Whisper logit loop and sampler see only
+            // the non-prompt groups (PROMPT groups already have finish_iteration() done).
+            scheduler_output.m_scheduled_sequence_groups_ids = std::move(non_prompt_ids);
+        } else {
+            // Single-phase step (no split needed) — classify by which phase is present.
+            const auto t_fwd0 = std::chrono::steady_clock::now();
+            logits = m_model_runner->forward(m_requests, scheduler_output);
+            accum_runner_timings();
+            const double dt_us = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t_fwd0).count();
+            if      (has_gen)   m_pipeline_metrics.generate_phase_us_total    += dt_us;
+            else if (has_trans) m_pipeline_metrics.transition_phase_us_total  += dt_us;
+            else                m_pipeline_metrics.prompt_phase_us_total      += dt_us;
+        }
+
         const auto infer_end = std::chrono::steady_clock::now();
         m_pipeline_metrics.inference_duration = PerfMetrics::get_microsec(infer_end - infer_start);
         timer.end();
+
+        // Update cumulative step counters.
+        // TRANSITION is now batched with GENERATE so count both in the generate metrics.
+        m_pipeline_metrics.total_steps++;
+        if (has_gen || has_trans) {
+            m_pipeline_metrics.generate_steps++;
+            m_pipeline_metrics.generate_batch_token_sum += gen_ids.size() + trans_ids.size();
+        }
     }
 
 #ifdef DEBUG_CACHE_STATE_DUMP
@@ -1216,24 +2090,55 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
     step_count++;
 #endif
 
+    // When only PROMPT groups were scheduled (e.g. Whisper prompt_needs_solo step),
+    // logits was never assigned in the needs_any_split branch — it's still a
+    // default-constructed ov::Tensor with shape {}.  Downstream routines
+    // (_fill_prompt_log_probs, sampler) unconditionally call logits.get_shape() and
+    // OPENVINO_ASSERT(shape.size() == 3) before checking is_scheduled(), which would
+    // throw and leave requests with allocated KV blocks → BlockManager destructor
+    // assertion.  Provide a valid-but-empty 3-D tensor; no logit data is read because
+    // all PROMPT groups have is_scheduled()==false after finish_iteration().
+    if (!logits) {
+        logits = ov::Tensor(ov::element::f32, ov::Shape{1, 0, 1});
+    }
+
     // process generation_config.echo parameter
     _fill_prompt_log_probs(m_requests, logits);
 
     // Apply Whisper-specific logit processing (suppress tokens, timestamp forcing)
     // This mirrors what process_whisper_logits() does in whisper.cpp for each decode step.
-    // The logits tensor here is [total_scheduled_tokens, 1, vocab] or [1, T, vocab] — the
-    // do_suppress_tokens / process_whisper_timestamp_logits helpers look at the LAST token
-    // in the sequence dimension (shape[1]-1), which is exactly position T-1 (the first free
-    // token position during prefill, or the single new token during decode).
+    //
+    // CRITICAL: iterate in scheduler_output.m_scheduled_sequence_groups_ids order, NOT
+    // m_requests order.  The model output logits are laid out in the scheduler's token order
+    // (which is also the order model_runner fills input_ids and encoder_hidden_states).
+    // Iterating m_requests instead produces logit/request misalignment when the scheduler
+    // reorders sequences (e.g. PROMPT-first policy), causing late-arriving requests (req3/4)
+    // to receive wrong logits → premature EOT.
     if (m_has_whisper_config) {
-        for (size_t seq_group_idx = 0, offset = 0; seq_group_idx < m_requests.size(); ++seq_group_idx) {
-            auto& sg = m_requests[seq_group_idx];
-            if (!sg->is_scheduled() || !sg->requires_sampling())
-                continue;
+        for (size_t sched_idx = 0, offset = 0;
+             sched_idx < scheduler_output.m_scheduled_sequence_groups_ids.size();
+             ++sched_idx) {
+            size_t sg_id = scheduler_output.m_scheduled_sequence_groups_ids[sched_idx];
+            auto& sg = m_requests[sg_id];
 
             const size_t num_running = sg->num_running_seqs();
             const size_t output_seq_len = sg->get_output_seq_len();
             const size_t vocab_size = logits.get_shape().back();
+
+            // Always advance offset so subsequent sequences read from the correct position.
+            // output_seq_len is 0 for non-sampling PROMPT steps (matmul_gathering filters
+            // them out), so the advance is a no-op for those steps.
+            if (!sg->requires_sampling()) {
+                if (cb_verbose()) std::cout << "[LOGIT_OFFSET] sched[" << sched_idx << "] sg_id=" << sg_id
+                                             << " req=" << sg->get_request_id()
+                                             << " PROMPT(skip) offset=" << offset << " output_seq_len=" << output_seq_len << "\n";
+                offset += output_seq_len * num_running;
+                continue;
+            }
+
+            if (cb_verbose()) std::cout << "[LOGIT_OFFSET] sched[" << sched_idx << "] sg_id=" << sg_id
+                                         << " req=" << sg->get_request_id()
+                                         << " offset=" << offset << " output_seq_len=" << output_seq_len << "\n";
 
             // Build a view into this sequence group's portion of the logits tensor
             const float* base = logits.data<float>() + offset * vocab_size;
@@ -1260,6 +2165,47 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
                 }
                 // 3) Timestamp logit processing when return_timestamps is set
                 if (m_whisper_gen_config.return_timestamps) {
+                    // Debug: show the state before timestamp logit processing (verbose only)
+                    if (cb_verbose()) {
+                        const size_t vocab_size_dbg = sg_logits.get_shape().back();
+                        const size_t seq_offset = (sg_logits.get_shape()[1] - 1) * vocab_size_dbg;
+                        const float* ldata = sg_logits.data<float>() + batch * sg_logits.get_shape()[1] * vocab_size_dbg + seq_offset;
+                        const size_t ts_begin = m_whisper_gen_config.no_timestamps_token_id + 1;
+                        const int64_t eos_id = m_whisper_gen_config.eos_token_id;
+                        float eos_logit = (eos_id >= 0 && (size_t)eos_id < vocab_size_dbg) ? ldata[eos_id] : -1e9f;
+                        // compute max over all tokens
+                        float max_logit = *std::max_element(ldata, ldata + vocab_size_dbg);
+                        // compute log-sum-exp of timestamps
+                        float ts_max = -1e30f;
+                        for (size_t i = ts_begin; i < vocab_size_dbg; ++i) ts_max = std::max(ts_max, ldata[i]);
+                        float ts_sum = 0.f;
+                        // use regular softmax max for stability
+                        float all_max = max_logit;
+                        float denom = 0.f;
+                        for (size_t i = 0; i < vocab_size_dbg; ++i) denom += std::exp(ldata[i] - all_max);
+                        for (size_t i = ts_begin; i < vocab_size_dbg; ++i) ts_sum += std::exp(ldata[i] - all_max);
+                        float ts_prob = ts_sum / denom;
+                        // argmax
+                        size_t argmax = (size_t)(std::max_element(ldata, ldata + vocab_size_dbg) - ldata);
+                        // top-5 tokens
+                        std::vector<std::pair<float,size_t>> top;
+                        for (size_t ti = 0; ti < vocab_size_dbg; ++ti) top.push_back({ldata[ti], ti});
+                        std::partial_sort(top.begin(), top.begin()+5, top.end(),
+                            [](auto& a, auto& b){ return a.first > b.first; });
+                        std::cout << "[WHISPER_LOGIT_DBG] req=" << sg->get_request_id()
+                                  << " gen_len=" << generated_ids.size()
+                                  << " initial=" << initial_step
+                                  << " argmax=" << argmax << " max_logit=" << max_logit
+                                  << " eos(" << eos_id << ")=" << eos_logit
+                                  << " ts_prob=" << ts_prob
+                                  << " top5=[";
+                        for (int ti = 0; ti < 5; ++ti)
+                            std::cout << top[ti].second << ":" << top[ti].first << (ti<4?",":"");
+                        std::cout << "] last3_gen=[";
+                        size_t start = generated_ids.size() > 3 ? generated_ids.size()-3 : 0;
+                        for (size_t gi = start; gi < generated_ids.size(); ++gi) std::cout << generated_ids[gi] << (gi+1<generated_ids.size()?",":"");
+                        std::cout << "]\n";
+                    }
                     ov::genai::process_whisper_timestamp_logits(
                         sg_logits, batch, m_whisper_gen_config, generated_ids, initial_step);
                 }
@@ -1478,6 +2424,9 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_free_non_running_reque
                 }
             }
             m_sampler->clear_request_info(request->get_request_id());
+            // Release cross-KV slot (swap-to-end compaction, ~245 MB, once per request)
+            if (m_cross_kv_cache)
+                m_cross_kv_cache->release(request->get_request_id());
             requests_iterator = m_requests.erase(requests_iterator);
         } else {
             requests_iterator++;

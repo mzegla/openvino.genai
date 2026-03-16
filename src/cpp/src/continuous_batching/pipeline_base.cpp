@@ -577,25 +577,61 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(
     m_whisper_gen_config = sampling_params;
     m_has_whisper_config = true;
 
-    // Run speech through the encoder to get hidden states for the decoder
-    std::vector<std::pair<ov::Tensor, ov::Tensor>> decoder_inputs;
-    auto [context_tokens, tokenization_duration_microseconds] = prepare_context_tokens(sampling_params, m_tokenizer);
-    {
-        std::lock_guard<std::mutex> lock(m_speech_encoder_mutex);
-        decoder_inputs = m_speech_encoder->encode(raw_speech, context_tokens, sampling_params);
-    }
+    // Run speech through the encoder to get hidden states for the decoder.
+    // When SKIP_ENCODING=1 the encoder is run only on the first request; all
+    // subsequent requests reuse the cached output.  This isolates decoder
+    // throughput from encoder latency for benchmarking purposes.
+    const bool skip_encoding = [] {
+        const char* v = std::getenv("SKIP_ENCODING");
+        return v && std::string(v) == "1";
+    }();
 
-    // For initial tests process only first frame
-    auto& [input_ids, encoder_hidden_states] = decoder_inputs[0];
-    std::cout << "Calling internal add_request with input_ids shape: ";
-    for (const auto& dim : input_ids.get_shape()) {
-        std::cout << dim << " ";
+    ov::Tensor input_ids, encoder_hidden_states;
+
+    if (skip_encoding && m_cached_encoder_hidden_states) {
+        // Reuse previously computed encoder output (deep copies so each request
+        // gets its own independent tensor that the CB pipeline can freely modify).
+        input_ids             = ov::Tensor(m_cached_encoder_input_ids.get_element_type(),
+                                           m_cached_encoder_input_ids.get_shape());
+        encoder_hidden_states = ov::Tensor(m_cached_encoder_hidden_states.get_element_type(),
+                                           m_cached_encoder_hidden_states.get_shape());
+        m_cached_encoder_input_ids.copy_to(input_ids);
+        m_cached_encoder_hidden_states.copy_to(encoder_hidden_states);
+    } else {
+        std::vector<std::pair<ov::Tensor, ov::Tensor>> decoder_inputs;
+        auto [context_tokens, tokenization_duration_microseconds] = prepare_context_tokens(sampling_params, m_tokenizer);
+        {
+            std::lock_guard<std::mutex> lock(m_speech_encoder_mutex);
+            decoder_inputs = m_speech_encoder->encode(raw_speech, context_tokens, sampling_params);
+        }
+        // For initial tests process only first frame
+        input_ids             = decoder_inputs[0].first;
+        encoder_hidden_states = decoder_inputs[0].second;
+
+        if (skip_encoding) {
+            // First call — stash a deep copy so future requests can skip encoding.
+            m_cached_encoder_input_ids = ov::Tensor(input_ids.get_element_type(),
+                                                    input_ids.get_shape());
+            m_cached_encoder_hidden_states = ov::Tensor(encoder_hidden_states.get_element_type(),
+                                                        encoder_hidden_states.get_shape());
+            input_ids.copy_to(m_cached_encoder_input_ids);
+            encoder_hidden_states.copy_to(m_cached_encoder_hidden_states);
+            std::cout << "[SKIP_ENCODING] Encoder output cached for reuse ("
+                      << encoder_hidden_states.get_size() * encoder_hidden_states.get_element_type().size()
+                      << " bytes)\n";
+        }
     }
-    std::cout << " and encoder_hidden_states shape: ";
-    for (const auto& dim : encoder_hidden_states.get_shape()) {
-        std::cout << dim << " ";
+    if (cb_verbose()) {
+        std::cout << "Calling internal add_request with input_ids shape: ";
+        for (const auto& dim : input_ids.get_shape()) {
+            std::cout << dim << " ";
+        }
+        std::cout << " and encoder_hidden_states shape: ";
+        for (const auto& dim : encoder_hidden_states.get_shape()) {
+            std::cout << dim << " ";
+        }
+        std::cout << std::endl;
     }
-    std::cout << std::endl;
     return add_request(request_id, input_ids, encoder_hidden_states, sampling_params);
 }
 

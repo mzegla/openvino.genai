@@ -322,12 +322,34 @@ WhisperGenerateResult whisper_generate(const ov::genai::WhisperGenerationConfig&
 
         auto input_features_chunk = input_features.get_data_with_offset(chunk_offset, feature_extractor.nb_max_frames);
 
-        ov::Tensor hidden_state_tensor = encode(encoder,
-                                                input_features_chunk,
-                                                1,
-                                                feature_extractor.feature_size,
-                                                feature_extractor.nb_max_frames,
-                                                raw_metrics);
+        // SKIP_ENCODING=1: run the encoder only on the very first call and cache the
+        // output.  All subsequent calls return a deep copy of the cached tensor.
+        // Intended for benchmarking decoder throughput in isolation.
+        static const bool s_skip_encoding = [] {
+            const char* v = std::getenv("SKIP_ENCODING");
+            return v && std::string(v) == "1";
+        }();
+        static ov::Tensor s_cached_hidden_state;
+
+        ov::Tensor hidden_state_tensor;
+        if (s_skip_encoding && s_cached_hidden_state) {
+            hidden_state_tensor = ov::Tensor(s_cached_hidden_state.get_element_type(),
+                                             s_cached_hidden_state.get_shape());
+            s_cached_hidden_state.copy_to(hidden_state_tensor);
+        } else {
+            hidden_state_tensor = encode(encoder,
+                                         input_features_chunk,
+                                         1,
+                                         feature_extractor.feature_size,
+                                         feature_extractor.nb_max_frames,
+                                         raw_metrics);
+            if (s_skip_encoding) {
+                s_cached_hidden_state = ov::Tensor(hidden_state_tensor.get_element_type(),
+                                                   hidden_state_tensor.get_shape());
+                hidden_state_tensor.copy_to(s_cached_hidden_state);
+                std::cout << "[SKIP_ENCODING] Native encoder output cached for reuse\n";
+            }
+        }
 
         // prepare sot_tokens just once for whole input
         if (sot_tokens.empty()) {

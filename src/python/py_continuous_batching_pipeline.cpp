@@ -126,6 +126,11 @@ auto scheduler_config_docstring = R"(
     cache_eviction_config       Cache eviction configuration struct.
     use_sparse_attention        Whether to use sparse attention during prefill.
     sparse_attention_config     Sparse attention configuration struct.
+    max_num_tokens_per_prefill_step: Maximum number of tokens to schedule per prefill request per
+        scheduler step. When set to 0 (default), no additional limit is applied beyond
+        max_num_batched_tokens. Setting this to 1 forces single-token prefill steps so that
+        PagedAttention uses the GENERATE-path numerics (q_cnt=1), avoiding batched-GEMM numerical
+        drift. Useful for encoder-decoder models such as Whisper.
 )";
 
 auto generation_result_docstring = R"(
@@ -383,6 +388,7 @@ void init_continuous_batching_pipeline(py::module_& m) {
         .def_readwrite("cache_eviction_config", &SchedulerConfig::cache_eviction_config)
         .def_readwrite("use_sparse_attention", &SchedulerConfig::use_sparse_attention)
         .def_readwrite("sparse_attention_config", &SchedulerConfig::sparse_attention_config)
+        .def_readwrite("max_num_tokens_per_prefill_step", &SchedulerConfig::max_num_tokens_per_prefill_step)
         .def("to_string", &SchedulerConfig::to_string);
 
     py::class_<PipelineMetrics>(m, "PipelineMetrics", pipeline_metrics_docstring)

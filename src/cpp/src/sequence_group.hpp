@@ -16,6 +16,16 @@
 #include "generation_stream.hpp"
 
 namespace ov::genai {
+
+// Returns true when OPENVINO_LOG_LEVEL > 1 (cached after first call).
+inline bool cb_verbose() {
+    static const bool val = []() -> bool {
+        const char* e = std::getenv("OPENVINO_LOG_LEVEL");
+        return e && std::atoi(e) > 1;
+    }();
+    return val;
+}
+
 enum class SequenceStatus {
     RUNNING = 0,
     FINISHED = 1,
@@ -325,6 +335,8 @@ class SequenceGroup  : public std::enable_shared_from_this<SequenceGroup> {
     bool m_has_echoed = false;
     SequenceGroupType m_sequence_group_type;
     std::optional<ov::Tensor> m_encoder_hidden_state;
+    // Slot index in the CrossKVCache buffer; UINT32_MAX means not yet admitted.
+    uint32_t m_cross_kv_slot_id = UINT32_MAX;
 
     uint64_t m_next_sequence_id = 0;
 
@@ -715,18 +727,11 @@ public:
     }
 
     const std::optional<ov::Tensor> get_encoder_hidden_state() const {
-        if (m_encoder_hidden_state.has_value()) {
-            std::cout << "get_encoder_hidden_state() called - returning encoder_hidden_state with shape: [";
-            for (size_t i = 0; i < m_encoder_hidden_state->get_shape().size(); ++i) {
-                std::cout << m_encoder_hidden_state->get_shape()[i];
-                if (i < m_encoder_hidden_state->get_shape().size() - 1) std::cout << ", ";
-            }
-            std::cout << "], data_ptr: " << static_cast<const void*>(m_encoder_hidden_state->data()) << "\n";
-        } else {
-            std::cout << "get_encoder_hidden_state() called - NO encoder_hidden_state available!\n";
-        }
         return m_encoder_hidden_state;
     }
+
+    uint32_t get_cross_kv_slot_id() const { return m_cross_kv_slot_id; }
+    void     set_cross_kv_slot_id(uint32_t slot_id) { m_cross_kv_slot_id = slot_id; }
 
     std::optional<std::vector<int64_t>> get_token_type_ids() const {
         return m_token_type_ids;
@@ -843,19 +848,23 @@ public:
     }
 
     void push_partial_outputs(size_t token_cnt = 1) {
-        std::cout << "DEBUG push_partial_outputs: token_cnt=" << token_cnt 
-                  << ", num_seqs=" << m_sequences.size() << "\n";
+        if (cb_verbose()) {
+            std::cout << "DEBUG push_partial_outputs: token_cnt=" << token_cnt 
+                      << ", num_seqs=" << m_sequences.size() << "\n";
+        }
         GenerationOutputs outputs;
         for (auto& sequence : m_sequences) {
             // todo: check seq.is_finished() to generate without several </s>
             // or is it ok to use padding?
             auto output = sequence->get_last_generation_output(token_cnt, m_stream_window_size);
-            std::cout << "  Seq " << sequence->get_id() << ": pushing " << output.generated_ids.size() << " tokens: [";
-            for (size_t i = 0; i < output.generated_ids.size(); ++i) {
-                std::cout << output.generated_ids[i];
-                if (i < output.generated_ids.size() - 1) std::cout << ", ";
+            if (cb_verbose()) {
+                std::cout << "  Seq " << sequence->get_id() << ": pushing " << output.generated_ids.size() << " tokens: [";
+                for (size_t i = 0; i < output.generated_ids.size(); ++i) {
+                    std::cout << output.generated_ids[i];
+                    if (i < output.generated_ids.size() - 1) std::cout << ", ";
+                }
+                std::cout << "]\n";
             }
-            std::cout << "]\n";
             if (m_sampling_params.echo && !m_has_echoed) {
                 output.generated_ids.insert(output.generated_ids.begin(), m_prompt_ids.begin(), m_prompt_ids.end());
                 output.generated_log_probs.insert(output.generated_log_probs.begin(), m_prompt_log_probs.begin(), m_prompt_log_probs.end());

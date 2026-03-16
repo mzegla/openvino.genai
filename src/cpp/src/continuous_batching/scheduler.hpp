@@ -112,10 +112,7 @@ public:
         }
 
         size_t total_kv_blocks = m_block_manager->get_total_number_of_kv_blocks();
-        std::cout << "\n=== SCHEDULER: Calling allocate_cache_if_needed ===\n";
-        std::cout << "Total KV blocks from BlockManager: " << total_kv_blocks << "\n";
         m_cache_manager->allocate_cache_if_needed(total_kv_blocks);
-        std::cout << "KV cache allocation call complete\n\n";
         _clear_waiting_sequences(sequence_groups);
         scheduler_output.m_cache_usage = m_block_manager->get_used_percentage();
 
@@ -299,6 +296,13 @@ private:
 
                 // apply megabatch limitations
                 size_t num_scheduled_tokens = std::min(num_tokens_in_megabatch, num_available_tokens);
+
+                // apply per-prefill-step token limit (when set, forces single-token prefill steps so that
+                // PagedAttention uses q_cnt=1 — the GENERATE path — avoiding batched-GEMM numerical drift;
+                // required for encoder-decoder models like Whisper whose decoder SOT prefix must be processed
+                // identically to GENERATE tokens to avoid wrong K/V cache values)
+                if (m_config.max_num_tokens_per_prefill_step > 0)
+                    num_scheduled_tokens = std::min(num_scheduled_tokens, m_config.max_num_tokens_per_prefill_step);
 
                 // apply KV cache limitations
                 size_t block_size = get_block_size();

@@ -50,6 +50,24 @@ void process_whisper_timestamp_logits(ov::Tensor& logits,
             for (size_t i = timestamp_begin; i < vocab_size; i++) {
                 logits_data[i] = -std::numeric_limits<float>::infinity();
             }
+            // Suppress EOS after two consecutive IDENTICAL timestamps.
+            //
+            // The pattern <|t|><|t|> is Whisper's "segment-boundary overlap" artifact
+            // (segment-end token repeated as segment-start); the only valid continuation
+            // is text — EOS here would truncate the transcript prematurely.
+            //
+            // Two DIFFERENT consecutive timestamps <|t1|><|t2|> can legitimately end
+            // with EOS (closed empty segment), so we only suppress EOS for the equal case.
+            //
+            // Root cause this guards against: BF16 KV precision drift in high-concurrency
+            // G+G batching shifts a segment-boundary timestamp by a small amount, but the
+            // model's corrupted KV then predicts EOS instead of the next text word when
+            // EOS is left unconstrained.  Suppressing EOS here forces the model to predict
+            // the correct next text token even when its logit distribution is slightly off.
+            if (generated_length >= 2 &&
+                generated_tokens[generated_length - 1] == generated_tokens[generated_length - 2]) {
+                logits_data[config.eos_token_id] = -std::numeric_limits<float>::infinity();
+            }
         } else {
             // cannot be normal text token
             for (size_t i = 0; i < config.eos_token_id; i++) {

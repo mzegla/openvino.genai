@@ -75,6 +75,11 @@ protected:
     std::shared_ptr<SpeechEncoder> m_speech_encoder;
     std::mutex m_speech_encoder_mutex;
 
+    // SKIP_ENCODING=1 support: cache the encoder output from the first request
+    // and reuse it for all subsequent requests, bypassing encoder inference.
+    ov::Tensor m_cached_encoder_input_ids;       ///< SOT token ids from first encode
+    ov::Tensor m_cached_encoder_hidden_states;   ///< encoder_hidden_states from first encode
+
     // Stored when add_request(raw_speech, WhisperGenerationConfig) is called; used
     // in step() to apply Whisper-specific logit processing (timestamp forcing, etc.)
     WhisperGenerationConfig m_whisper_gen_config;
