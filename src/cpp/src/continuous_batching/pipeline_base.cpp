@@ -568,6 +568,26 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(
     return add_request(request_id, inputs, std::move(sampling_params));
 }
 
+std::pair<ov::Tensor, ov::Tensor>
+ContinuousBatchingPipeline::IContinuousBatchingPipeline::encode_speech(
+    const RawSpeechInput& raw_speech,
+    const WhisperGenerationConfig& config) {
+    OPENVINO_ASSERT(m_speech_encoder, "encode_speech() requires a Whisper pipeline with a speech encoder");
+    auto [context_tokens, tokenization_duration_microseconds] = prepare_context_tokens(config, m_tokenizer);
+    // encode() is now thread-safe: SpeechEncoder uses a pool of InferRequests
+    // (compiled with THROUGHPUT hint) so concurrent callers each get their own
+    // request without any external serialisation.
+    auto decoder_inputs = m_speech_encoder->encode(raw_speech, context_tokens, config);
+    {
+        // Only the brief timing-field update requires the mutex now.
+        std::lock_guard<std::mutex> lock(m_speech_encoder_mutex);
+        m_last_encoder_infer_ms   = m_speech_encoder->get_last_encoder_infer_ms();
+        m_last_feature_extract_ms = m_speech_encoder->get_last_feature_extract_ms();
+        m_last_sot_tokens_ms      = m_speech_encoder->get_last_sot_tokens_ms();
+    }
+    return {decoder_inputs[0].first, decoder_inputs[0].second};
+}
+
 GenerationHandle
 ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(
     uint64_t request_id,
@@ -598,15 +618,9 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(
         m_cached_encoder_input_ids.copy_to(input_ids);
         m_cached_encoder_hidden_states.copy_to(encoder_hidden_states);
     } else {
-        std::vector<std::pair<ov::Tensor, ov::Tensor>> decoder_inputs;
-        auto [context_tokens, tokenization_duration_microseconds] = prepare_context_tokens(sampling_params, m_tokenizer);
-        {
-            std::lock_guard<std::mutex> lock(m_speech_encoder_mutex);
-            decoder_inputs = m_speech_encoder->encode(raw_speech, context_tokens, sampling_params);
-        }
-        // For initial tests process only first frame
-        input_ids             = decoder_inputs[0].first;
-        encoder_hidden_states = decoder_inputs[0].second;
+        auto [ids, hs] = encode_speech(raw_speech, sampling_params);
+        input_ids             = ids;
+        encoder_hidden_states = hs;
 
         if (skip_encoding) {
             // First call — stash a deep copy so future requests can skip encoding.

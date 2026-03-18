@@ -163,8 +163,10 @@ int main(int argc, char* argv[]) try {
     }
 
     // Word timestamps require decomposition of cross-attention decoder SDPA layers,
-    // so word_timestamps must be passed to the pipeline constructor (not just in generation config)
-    ov_config.insert(ov::genai::word_timestamps(true));
+    // so word_timestamps must be passed to the pipeline constructor (not just in generation config).
+    // Disabled: not all model exports include 'alignment_heads' in generation_config.json
+    // (e.g. whisper-large-v3), which is required for word_timestamps=true.
+    // ov_config.insert(ov::genai::word_timestamps(true));
     ov::genai::WhisperPipeline pipeline(models_path.parent_path() / (models_path.filename().string() + "-stateful"), device, ov_config);
 
     ov::genai::WhisperGenerationConfig config = pipeline.get_generation_config();
@@ -172,7 +174,7 @@ int main(int argc, char* argv[]) try {
     config.language = "<|en|>";  // can switch to <|zh|> for Chinese language
     config.task = "transcribe";
     config.return_timestamps = true;
-    config.word_timestamps = true;
+    config.word_timestamps = false;
 
     // Pipeline expects normalized audio with Sample Rate of 16kHz
     ov::genai::RawSpeechInput raw_speech1 = utils::audio::read_wav(wav_file_path1);

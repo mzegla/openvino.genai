@@ -1841,6 +1841,9 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request(uint64_t request
                                  const ov::Tensor& encoder_hidden_state,
                                  const ov::genai::WhisperGenerationConfig& sampling_params) {
     if (cb_verbose()) std::cout << "ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request with encoder_hidden_state called\n";
+    // Persist the Whisper config so step()-time logit processing has access to it.
+    m_whisper_gen_config = sampling_params;
+    m_has_whisper_config = true;
     // WhisperGenerationConfig inherits from GenerationConfig, so we can pass it directly
     return add_request(request_id, input_ids, sampling_params, std::nullopt, encoder_hidden_state);
 }
@@ -1999,6 +2002,9 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
             auto lt = m_model_runner->get_last_timings();
             m_pipeline_metrics.cross_attn_assembly_us_total += lt.assembly_us;
             m_pipeline_metrics.ov_infer_us_total            += lt.infer_us;
+            if (m_cross_kv_cache)
+                m_pipeline_metrics.cross_kv_proj_us_total =
+                    m_cross_kv_cache->get_proj_infer_us();
         };
 
         if (needs_any_split) {

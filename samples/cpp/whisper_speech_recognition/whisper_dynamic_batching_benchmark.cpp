@@ -26,9 +26,13 @@ struct RequestMetrics {
     std::chrono::steady_clock::time_point arrival_time;
     std::chrono::steady_clock::time_point start_time;
     std::chrono::steady_clock::time_point completion_time;
-    double queue_time_ms;  // Time waiting in queue
-    double processing_time_ms;  // Time being processed
-    double total_latency_ms;  // Total time from arrival to completion
+    double queue_time_ms;       // Time waiting in queue
+    double processing_time_ms;   // Time being processed
+    double total_latency_ms;     // Total time from arrival to completion
+    double encode_time_ms = 0.0;        // Wall time of add_request() (CB mode; encoder + PA setup)
+    double encoder_infer_ms = 0.0;       // Encoder model infer() time only (both modes)
+    double feature_extract_ms = 0.0;     // MEL feature extraction time (both modes)
+    double sot_tokens_ms = 0.0;          // prepare_sot_tokens time (both modes)
     std::string text;  // Output text for correctness validation (native mode)
     std::vector<int64_t> tokens;  // Output tokens for correctness validation (CB mode)
 };
@@ -166,6 +170,21 @@ public:
                 
                 // Extract text for correctness validation
                 metrics_entry.text = result.texts.empty() ? "" : result.texts[0];
+
+                // Compute encoder component timings from perf_metrics
+                {
+                    const auto& raw = result.perf_metrics.raw_metrics;
+                    double total_infer_ms = raw.m_inference_durations.empty() ? 0.0
+                        : raw.m_inference_durations[0].count() / 1000.0;
+                    double decoder_infer_ms = 0.0;
+                    for (const auto& d : raw.m_token_infer_durations)
+                        decoder_infer_ms += d.count() / 1000.0;
+                    metrics_entry.encoder_infer_ms = total_infer_ms - decoder_infer_ms;
+
+                    const auto& wraw = result.perf_metrics.whisper_raw_metrics;
+                    if (!wraw.features_extraction_durations.empty())
+                        metrics_entry.feature_extract_ms = wraw.features_extraction_durations[0].count() / 1000.0;
+                }
                 
                 {
                     std::lock_guard<std::mutex> lock(metrics_mutex);
@@ -206,27 +225,112 @@ public:
             size_t request_id;
             std::chrono::steady_clock::time_point arrival_time;
             std::chrono::steady_clock::time_point start_time;
+            double encode_time_ms = 0.0;       // wall time of add_request() (encoder + PA setup)
+            double encoder_infer_ms = 0.0;      // encoder model infer() only
+            double feature_extract_ms = 0.0;    // MEL feature extraction
+            double sot_tokens_ms = 0.0;         // prepare_sot_tokens
             ov::genai::GenerationHandle handle;
             std::vector<int64_t> tokens;
         };
         std::vector<ActiveRequest> active;
 
+        // Requests that have been encoded and are ready to add to the CB pipeline.
+        // Written by encoding threads, drained by the step loop thread.
+        struct EncodedRequest {
+            size_t request_id;
+            std::chrono::steady_clock::time_point arrival_time;
+            std::chrono::steady_clock::time_point encode_start_time;
+            double encode_time_ms     = 0.0;
+            double encoder_infer_ms   = 0.0;
+            double feature_extract_ms = 0.0;
+            double sot_tokens_ms      = 0.0;
+            ov::Tensor input_ids;
+            ov::Tensor encoder_hidden_states;
+        };
+        std::vector<EncodedRequest> encoded_ready;
+        std::mutex encoded_ready_mutex;
+        std::atomic<int> encoding_threads_in_flight{0};
+
+        // Kick off an encoding background thread per pending raw request.
+        // Only encode_speech() is called from the thread — fully thread-safe.
+        // The resulting EncodedRequest is queued; the step loop thread calls
+        // the fast add_request(input_ids, encoder_hs, config) without concurrency.
+        auto launch_encoding = [&](std::vector<PendingRequest>& pending) {
+            for (auto& req : pending) {
+                encoding_threads_in_flight++;
+                std::thread([&cb_pipe, &encoded_ready, &encoded_ready_mutex,
+                             &encoding_threads_in_flight, req, cfg = config]() mutable {
+                    EncodedRequest er;
+                    er.request_id        = req.request_id;
+                    er.arrival_time      = req.arrival_time;
+                    er.encode_start_time = std::chrono::steady_clock::now();
+
+                    const auto t0 = std::chrono::steady_clock::now();
+                    // encode_speech() is serialized internally by m_speech_encoder_mutex
+                    auto [input_ids, encoder_hs] = cb_pipe->encode_speech(
+                        req.audio, static_cast<ov::genai::WhisperGenerationConfig>(cfg));
+                    er.encode_time_ms     = std::chrono::duration<double, std::milli>(
+                                               std::chrono::steady_clock::now() - t0).count();
+                    er.encoder_infer_ms   = cb_pipe->get_last_encoder_infer_ms();
+                    er.feature_extract_ms = cb_pipe->get_last_feature_extract_ms();
+                    er.sot_tokens_ms      = cb_pipe->get_last_sot_tokens_ms();
+                    er.input_ids          = std::move(input_ids);
+                    er.encoder_hidden_states = std::move(encoder_hs);
+
+                    {
+                        std::lock_guard<std::mutex> lk(encoded_ready_mutex);
+                        encoded_ready.push_back(std::move(er));
+                    }
+                    encoding_threads_in_flight--;
+                }).detach();
+            }
+        };
+
+        // Drain the raw-request queue → launch encoding threads.
         auto ingest_queue = [&]() {
-            std::lock_guard<std::mutex> lock(queue_mutex);
-            while (!request_queue.empty()) {
-                auto req = request_queue.front();
-                request_queue.pop();
-                auto start_time = std::chrono::steady_clock::now();
+            std::vector<PendingRequest> pending;
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                while (!request_queue.empty()) {
+                    pending.push_back(request_queue.front());
+                    request_queue.pop();
+                }
+            }
+            launch_encoding(pending);
+        };
+
+        // Move encoded-and-ready requests into 'active' via the fast add_request.
+        // Called exclusively from the step loop thread → no concurrency with step().
+        auto drain_ready = [&]() {
+            std::vector<EncodedRequest> batch;
+            {
+                std::lock_guard<std::mutex> lk(encoded_ready_mutex);
+                batch.swap(encoded_ready);
+            }
+            for (auto& er : batch) {
+                const auto t_add0 = std::chrono::steady_clock::now();
                 auto req_cfg = static_cast<ov::genai::WhisperGenerationConfig>(config);
+                // Fast path: no encoding, just schedules the pre-computed tensors.
                 auto handle = cb_pipe->add_request(
-                    static_cast<uint64_t>(req.request_id), req.audio, req_cfg);
+                    static_cast<uint64_t>(er.request_id),
+                    er.input_ids, er.encoder_hidden_states, req_cfg);
+                const double add_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_add0).count();
+
                 ActiveRequest ar;
-                ar.request_id  = req.request_id;
-                ar.arrival_time = req.arrival_time;
-                ar.start_time   = start_time;
-                ar.handle       = std::move(handle);
+                ar.request_id         = er.request_id;
+                ar.arrival_time       = er.arrival_time;
+                ar.start_time         = er.encode_start_time;
+                ar.encode_time_ms     = er.encode_time_ms;
+                ar.encoder_infer_ms   = er.encoder_infer_ms;
+                ar.feature_extract_ms = er.feature_extract_ms;
+                ar.sot_tokens_ms      = er.sot_tokens_ms;
+                ar.handle             = std::move(handle);
+                std::cout << "[+] Request #" << ar.request_id
+                          << " added  (active: " << active.size() + 1
+                          << ", enc: " << std::fixed << std::setprecision(0)
+                          << ar.encode_time_ms << " ms, add: " << add_ms << " ms)\n";
                 active.push_back(std::move(ar));
-                std::cout << "[+] Request #" << req.request_id << " added  (active: " << active.size() << ")\n";
             }
         };
 
@@ -251,6 +355,10 @@ public:
                                                completion_time - it->start_time).count();
                     m.total_latency_ms   = std::chrono::duration<double, std::milli>(
                                                completion_time - it->arrival_time).count();
+                    m.encode_time_ms     = it->encode_time_ms;
+                    m.encoder_infer_ms   = it->encoder_infer_ms;
+                    m.feature_extract_ms = it->feature_extract_ms;
+                    m.sot_tokens_ms      = it->sot_tokens_ms;
                     m.tokens = std::move(it->tokens);
                     {
                         std::lock_guard<std::mutex> lock(metrics_mutex);
@@ -267,9 +375,10 @@ public:
         // Main step loop: ingest new requests, step, collect
         while (true) {
             ingest_queue();
+            drain_ready();
 
             if (active.empty()) {
-                if (stop_flag.load()) break;
+                if (stop_flag.load() && encoding_threads_in_flight.load() == 0) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
@@ -281,6 +390,10 @@ public:
 
         // Flush any requests that arrived right as stop_flag was raised
         ingest_queue();
+        // Wait for all encoding threads to complete before final step loop
+        while (encoding_threads_in_flight.load() > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        drain_ready();
         while (!active.empty()) {
             std::cout << "[Step] Active: " << active.size() << " request(s)\n";
             cb_pipe->step();
@@ -394,16 +507,29 @@ public:
         std::vector<double> latencies;
         std::vector<double> queue_times;
         std::vector<double> processing_times;
+        std::vector<double> encode_times;
+        std::vector<double> encoder_infer_times;
+        std::vector<double> feature_extract_times;
+        std::vector<double> sot_tokens_times;
         
         for (const auto& m : metrics) {
             latencies.push_back(m.total_latency_ms);
             queue_times.push_back(m.queue_time_ms);
             processing_times.push_back(m.processing_time_ms);
+            if (m.encode_time_ms > 0.0)
+                encode_times.push_back(m.encode_time_ms);
+            if (m.encoder_infer_ms > 0.0)
+                encoder_infer_times.push_back(m.encoder_infer_ms);
+            if (m.feature_extract_ms > 0.0)
+                feature_extract_times.push_back(m.feature_extract_ms);
+            if (m.sot_tokens_ms > 0.0)
+                sot_tokens_times.push_back(m.sot_tokens_ms);
         }
         
         std::sort(latencies.begin(), latencies.end());
         std::sort(queue_times.begin(), queue_times.end());
         std::sort(processing_times.begin(), processing_times.end());
+        std::sort(encode_times.begin(), encode_times.end());
         
         auto percentile = [](const std::vector<double>& sorted_data, double p) {
             size_t idx = static_cast<size_t>(sorted_data.size() * p);
@@ -414,6 +540,14 @@ public:
         double avg_latency = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
         double avg_queue = std::accumulate(queue_times.begin(), queue_times.end(), 0.0) / queue_times.size();
         double avg_processing = std::accumulate(processing_times.begin(), processing_times.end(), 0.0) / processing_times.size();
+        double avg_encode = encode_times.empty() ? 0.0
+            : std::accumulate(encode_times.begin(), encode_times.end(), 0.0) / encode_times.size();
+        double avg_encoder_infer = encoder_infer_times.empty() ? 0.0
+            : std::accumulate(encoder_infer_times.begin(), encoder_infer_times.end(), 0.0) / encoder_infer_times.size();
+        double avg_feature_extract = feature_extract_times.empty() ? 0.0
+            : std::accumulate(feature_extract_times.begin(), feature_extract_times.end(), 0.0) / feature_extract_times.size();
+        double avg_sot_tokens = sot_tokens_times.empty() ? 0.0
+            : std::accumulate(sot_tokens_times.begin(), sot_tokens_times.end(), 0.0) / sot_tokens_times.size();
         
         double throughput = metrics.size() / total_duration_seconds;
 
@@ -581,6 +715,26 @@ public:
         std::cout << "p50: " << percentile(processing_times, 0.50) << " ms\n";
         std::cout << "p95: " << percentile(processing_times, 0.95) << " ms\n";
 
+        if (!encode_times.empty()) {
+            std::cout << "\n--- Encoding / add_request Time (ms) ---\n";
+            std::cout << "Average: " << avg_encode << " ms\n";
+            std::cout << "p50: " << percentile(encode_times, 0.50) << " ms\n";
+            std::cout << "p95: " << percentile(encode_times, 0.95) << " ms\n";
+            std::cout << "(note: includes encoder inference + PA slot allocation)\n";
+        }
+
+        if (!encoder_infer_times.empty()) {
+            std::sort(encoder_infer_times.begin(), encoder_infer_times.end());
+            std::cout << "\n--- Encoder Breakdown (avg ms) ---\n";
+            std::cout << "  Feature extraction (MEL/FFT): " << avg_feature_extract << " ms\n";
+            std::cout << "  Encoder model infer():        " << avg_encoder_infer    << " ms\n";
+            std::cout << "  prepare_sot_tokens():         " << avg_sot_tokens       << " ms\n";
+            if (avg_feature_extract + avg_encoder_infer + avg_sot_tokens > 0.0) {
+                std::cout << "  Total accounted:              "
+                          << avg_feature_extract + avg_encoder_infer + avg_sot_tokens << " ms\n";
+            }
+        }
+
         // --- CB Step Timing Breakdown ---
         // Only printed for CB mode; cb_final_metrics is zero for native runs.
         if (!is_native_mode && cb_final_metrics.total_steps > 0) {
@@ -588,6 +742,7 @@ public:
                                       + cb_final_metrics.generate_phase_us_total;
             const double infer_us     = cb_final_metrics.ov_infer_us_total;
             const double assembly_us  = cb_final_metrics.cross_attn_assembly_us_total;
+            const double proj_us      = cb_final_metrics.cross_kv_proj_us_total;
             auto pct = [](double num, double den) -> double {
                 return den > 0.0 ? 100.0 * num / den : 0.0;
             };
@@ -616,6 +771,15 @@ public:
             std::cout << "Other overhead:        "
                       << (total_fwd_us - infer_us - assembly_us) / 1000.0
                       << " ms\n";
+            if (proj_us > 0.0) {
+                const size_t n_reqs = completed_requests.load();
+                std::cout << "\nCrossKV projector:     " << proj_us / 1000.0
+                          << " ms total  (avg " << std::setprecision(1)
+                          << (n_reqs > 0 ? proj_us / 1000.0 / n_reqs : 0.0)
+                          << " ms/req × " << n_reqs << " reqs)\n";
+                std::cout << "  (this runs in background after add_request(); not included in\n"
+                             "   forward wall time above — but delays scheduler visibility)\n";
+            }
             std::cout << "\n[KEY METRIC] Cross-attn assembly / OV infer ratio: "
                       << std::setprecision(1) << pct(assembly_us, infer_us) << "%\n";
             std::cout << "  (If this is >10% at N>1 concurrent requests, K/V projection\n"

@@ -131,6 +131,8 @@ public:
     // admit_precomputed(): store K/V from a projector InferRequest that
     // has already been run (outputs are valid). Used by lazy-init path to
     // avoid running infer() twice for the very first request.
+    // BLOCKS until a slot is free — do NOT call from the main pipeline
+    // step() thread (would deadlock with release() on the same thread).
     // -------------------------------------------------------------------
     void admit_precomputed(uint64_t req_id, ov::InferRequest& proj_req) {
         // Copy outputs from the already-completed request.
@@ -139,6 +141,21 @@ public:
         std::unique_lock<std::mutex> lk(m_mutex);
         m_slot_cv.wait(lk, [&] { return !m_free_slots.empty(); });
         _store_from_tensors(req_id, proj_K, proj_V, lk);  // releases lk before memcpy
+    }
+
+    // -------------------------------------------------------------------
+    // try_admit_precomputed_nowait(): non-blocking variant of admit_precomputed().
+    // Returns true and stores K/V if a free slot is available right now.
+    // Returns false immediately (no K/V stored) if all slots are occupied.
+    //
+    // Safe to call from the main pipeline step() thread — never blocks.
+    // -------------------------------------------------------------------
+    bool try_admit_precomputed_nowait(uint64_t req_id, ov::InferRequest& proj_req) {
+        auto [proj_K, proj_V] = _copy_proj_outputs(proj_req);
+        std::unique_lock<std::mutex> lk(m_mutex);
+        if (m_free_slots.empty()) return false;
+        _store_from_tensors(req_id, proj_K, proj_V, lk);  // releases lk before memcpy
+        return true;
     }
 
     // -------------------------------------------------------------------
@@ -311,12 +328,19 @@ public:
     size_t n_active()  const { std::lock_guard<std::mutex> lk(m_mutex); return m_req_to_slot.size(); }
     size_t n_layers()  const { return m_n_layers; }
     size_t max_slots() const { return m_max_slots; }
+    /// Cumulative wall time of all projector infer() calls, in microseconds.
+    double get_proj_infer_us() const {
+        std::lock_guard<std::mutex> lk(m_proj_mutex);
+        return m_proj_infer_us;
+    }
 
 private:
     ov::InferRequest m_proj_request;
 
     // Mutex serializing projector infer() calls (admit() is potentially concurrent)
-    std::mutex m_proj_mutex;
+    mutable std::mutex m_proj_mutex;
+    // Cumulative projector infer() wall time in microseconds (written only under m_proj_mutex)
+    double m_proj_infer_us = 0.0;
     // Mutex protecting slot bookkeeping state; also used by m_slot_cv
     mutable std::mutex m_mutex;
     // Notified by release() to wake up admit() calls blocked on a full buffer
@@ -436,7 +460,10 @@ private:
     _run_projector(const ov::Tensor& encoder_hidden_state) {
         std::lock_guard<std::mutex> plk(m_proj_mutex);
         m_proj_request.set_tensor("encoder_hidden_states", encoder_hidden_state);
+        const auto t0 = std::chrono::steady_clock::now();
         m_proj_request.infer();
+        m_proj_infer_us += std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - t0).count();
         return _copy_proj_outputs(m_proj_request);
     }
 

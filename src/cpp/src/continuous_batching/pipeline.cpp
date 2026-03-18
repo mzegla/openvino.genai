@@ -65,7 +65,9 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline( const std::filesystem::p
     std::shared_ptr<SpeechEncoder> speech_encoder = nullptr;
     if (std::filesystem::exists(models_path / "openvino_encoder_model.xml")) {
         std::cout << "Creating SpeechEncoder from " << (models_path / "openvino_encoder_model.xml") << std::endl;
-        speech_encoder = std::make_shared<SpeechEncoder>(models_path, device, properties_without_draft_model);
+        auto encoder_properties = properties_without_draft_model_without_gguf;
+        encoder_properties.erase(ov::hint::kv_cache_precision.name());
+        speech_encoder = std::make_shared<SpeechEncoder>(models_path, device, encoder_properties);
     }
 
     utils::print_scheduler_config_info(scheduler_config);
@@ -117,7 +119,9 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline(
     std::shared_ptr<SpeechEncoder> speech_encoder = nullptr;
     if (std::filesystem::exists(models_path / "openvino_encoder_model.xml")) {
         std::cout << "Creating SpeechEncoder from " << (models_path / "openvino_encoder_model.xml") << std::endl;
-        speech_encoder = std::make_shared<SpeechEncoder>(models_path, device, properties_without_draft_model);
+        auto encoder_properties = properties_without_draft_model_without_gguf;
+        encoder_properties.erase(ov::hint::kv_cache_precision.name());
+        speech_encoder = std::make_shared<SpeechEncoder>(models_path, device, encoder_properties);
     }
 
     utils::print_scheduler_config_info(scheduler_config);
@@ -297,6 +301,31 @@ GenerationHandle ContinuousBatchingPipeline::add_request(uint64_t request_id, co
 
 GenerationHandle ContinuousBatchingPipeline::add_request(uint64_t request_id, const RawSpeechInput& raw_speech, const ov::genai::WhisperGenerationConfig& sampling_params) {
     return m_impl->add_request(request_id, raw_speech, sampling_params);
+}
+
+std::pair<ov::Tensor, ov::Tensor> ContinuousBatchingPipeline::encode_speech(
+    const RawSpeechInput& raw_speech, const ov::genai::WhisperGenerationConfig& config) {
+    return m_impl->encode_speech(raw_speech, config);
+}
+
+GenerationHandle ContinuousBatchingPipeline::add_request(
+    uint64_t request_id,
+    const ov::Tensor& input_ids,
+    const ov::Tensor& encoder_hidden_states,
+    const ov::genai::WhisperGenerationConfig& sampling_params) {
+    return m_impl->add_request(request_id, input_ids, encoder_hidden_states, sampling_params);
+}
+
+double ContinuousBatchingPipeline::get_last_encoder_infer_ms() const {
+    return m_impl->get_last_encoder_infer_ms();
+}
+
+double ContinuousBatchingPipeline::get_last_feature_extract_ms() const {
+    return m_impl->get_last_feature_extract_ms();
+}
+
+double ContinuousBatchingPipeline::get_last_sot_tokens_ms() const {
+    return m_impl->get_last_sot_tokens_ms();
 }
 
 void ContinuousBatchingPipeline::step() {

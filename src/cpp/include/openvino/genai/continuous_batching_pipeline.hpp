@@ -72,6 +72,7 @@ struct PipelineMetrics {
     double prompt_phase_us_total        = 0.0;  ///< μs: PROMPT forward passes
     double transition_phase_us_total    = 0.0;  ///< μs: TRANSITION forward passes
     double generate_phase_us_total      = 0.0;  ///< μs: GENERATE forward passes
+    double cross_kv_proj_us_total       = 0.0;  ///< μs: CrossKVCache projector infer() cumulative
     size_t total_steps                  = 0;    ///< step() calls with at least one forward pass
     size_t generate_steps               = 0;    ///< steps that included ≥1 GENERATE request
     size_t generate_batch_token_sum     = 0;    ///< sum of GENERATE batch sizes (tokens) for avg
@@ -193,6 +194,23 @@ public:
 
      // Whisper specific
     GenerationHandle add_request(uint64_t request_id, const RawSpeechInput& raw_speech, const ov::genai::WhisperGenerationConfig& sampling_params);
+    /// Encode raw speech to (input_ids, encoder_hidden_states) without scheduling.
+    /// Thread-safe — multiple background threads may call this concurrently.
+    /// Use together with add_request(id, input_ids, encoder_hs, whisper_config) to
+    /// overlap encoding with decoding on the step-loop thread.
+    std::pair<ov::Tensor, ov::Tensor> encode_speech(const RawSpeechInput& raw_speech,
+                                                     const ov::genai::WhisperGenerationConfig& config);
+    /// Fast add_request for pre-encoded Whisper data.  No encoding is performed;
+    /// safe to call from the step-loop thread while encode_speech() runs elsewhere.
+    GenerationHandle add_request(uint64_t request_id,
+                                 const ov::Tensor& input_ids,
+                                 const ov::Tensor& encoder_hidden_states,
+                                 const ov::genai::WhisperGenerationConfig& sampling_params);
+    /// Returns the wall-time of the last encoder model infer() call in milliseconds.
+    /// Valid after add_request(RawSpeechInput, ...) returns; 0.0 before any such call.
+    double get_last_encoder_infer_ms() const;
+    double get_last_feature_extract_ms() const;
+    double get_last_sot_tokens_ms() const;
     
     void step();
 

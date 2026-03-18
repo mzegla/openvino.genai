@@ -14,6 +14,7 @@
 #include "whisper/config.hpp"
 #include "whisper/feature_extractor.hpp"
 #include "whisper/models.hpp"
+#include "circular_buffer_queue.hpp"
 
 namespace ov {
 namespace genai {
@@ -44,12 +45,18 @@ WhisperGenerateResult whisper_generate(const ov::genai::WhisperGenerationConfig&
 
 
 class SpeechEncoder {
-    // TODO: use pool of infer requests for better performance in multithreaded scenarios
-    ov::InferRequest m_encoder;
+    std::unique_ptr<CircularBufferQueue<ov::InferRequest>> m_encoder_pool;
+    mutable std::mutex m_decoder_mutex;  // serialize prepare_sot_tokens (decoder not pooled)
     std::shared_ptr<WhisperDecoder> m_decoder;
     WhisperFeatureExtractor m_feature_extractor;
     WhisperConfig m_model_config;
+    double m_last_encoder_infer_ms = 0.0;
+    double m_last_feature_extract_ms = 0.0;
+    double m_last_sot_tokens_ms = 0.0;
 public:
+    double get_last_encoder_infer_ms()    const { return m_last_encoder_infer_ms; }
+    double get_last_feature_extract_ms()  const { return m_last_feature_extract_ms; }
+    double get_last_sot_tokens_ms()        const { return m_last_sot_tokens_ms; }
     SpeechEncoder(const std::filesystem::path& model_path,
                   const std::string& device,
                   const ov::AnyMap& properties);

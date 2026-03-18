@@ -84,6 +84,9 @@ protected:
     // in step() to apply Whisper-specific logit processing (timestamp forcing, etc.)
     WhisperGenerationConfig m_whisper_gen_config;
     bool m_has_whisper_config = false;
+    double m_last_encoder_infer_ms = 0.0;
+    double m_last_feature_extract_ms = 0.0;
+    double m_last_sot_tokens_ms = 0.0;
 
     void stream_tokens(const std::shared_ptr<ThreadedStreamerWrapper>& streamer_ptr, const GenerationHandle& handle);
 public:
@@ -91,6 +94,9 @@ public:
     void set_config(const GenerationConfig& config);
     PipelineMetrics get_metrics() const;
     Tokenizer get_tokenizer();
+    double get_last_encoder_infer_ms()   const { return m_last_encoder_infer_ms; }
+    double get_last_feature_extract_ms() const { return m_last_feature_extract_ms; }
+    double get_last_sot_tokens_ms()       const { return m_last_sot_tokens_ms; }
 
     /**
      * Adds requests to awaiting queue using encoded inputs
@@ -142,6 +148,13 @@ public:
     GenerationHandle add_request(uint64_t request_id,
                                  const RawSpeechInput& raw_speech,
                                  const WhisperGenerationConfig& sampling_params);
+
+    /// Encode raw speech to (input_ids, encoder_hidden_states) without touching the
+    /// scheduler.  Thread-safe: calls are serialized by m_speech_encoder_mutex so
+    /// multiple background threads can safely encode concurrently.
+    /// Returns {input_ids, encoder_hidden_states} ready for fast add_request().
+    std::pair<ov::Tensor, ov::Tensor> encode_speech(const RawSpeechInput& raw_speech,
+                                                     const WhisperGenerationConfig& config);
 
     /**
      * Checks whether server (pipeline) has non-finished requests and step() should be called within a loop

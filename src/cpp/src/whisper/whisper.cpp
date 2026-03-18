@@ -452,19 +452,30 @@ WhisperGenerateResult whisper_generate(const ov::genai::WhisperGenerationConfig&
 SpeechEncoder::SpeechEncoder(const std::filesystem::path& model_path, const std::string& device, const ov::AnyMap& properties)
     : m_feature_extractor(model_path / "preprocessor_config.json"),
       m_model_config(model_path / "config.json") {
-    std::cout << "Speech encoder constructor called" << std::endl;
     ov::Core core;
     auto model = core.read_model(model_path / "openvino_encoder_model.xml");
-    auto compiled_model = core.compile_model(model, device, properties);
-    m_encoder = compiled_model.create_infer_request();
-    // For now stateful decoder to create init input_ids 
-    m_decoder = WhisperDecoder::from_path(model_path, device, properties, m_encoder.get_compiled_model().output("last_hidden_state").get_partial_shape(), false);
+    // Use THROUGHPUT hint so OV creates multiple execution streams; concurrent
+    // encode() callers each get their own InferRequest from the pool.
+    ov::AnyMap encoder_props = properties;
+    if (encoder_props.find(ov::hint::performance_mode.name()) == encoder_props.end()) {
+        encoder_props[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::THROUGHPUT;
+    }
+    auto compiled_model = core.compile_model(model, device, encoder_props);
+    const size_t num_ireqs = compiled_model.get_property(ov::optimal_number_of_infer_requests);
+    m_encoder_pool = std::make_unique<CircularBufferQueue<ov::InferRequest>>(
+        num_ireqs,
+        [&compiled_model]() -> ov::InferRequest {
+            return compiled_model.create_infer_request();
+        });
+    // Decoder for prepare_sot_tokens — not pooled, serialized via m_decoder_mutex.
+    m_decoder = WhisperDecoder::from_path(model_path, device, properties,
+        compiled_model.output("last_hidden_state").get_partial_shape(), false);
 }
 
 std::vector<std::pair<ov::Tensor, ov::Tensor>> SpeechEncoder::encode(const RawSpeechInput& raw_speech, const WhisperContextTokens& context_tokens, const ov::genai::WhisperGenerationConfig& config) {
-    std::cout << "Starting SpeechEncoder::encode\n";
+    const auto t_fe_0 = std::chrono::steady_clock::now();
     auto input_features = m_feature_extractor.extract(raw_speech);
-    std::cout << "Extracted features: " << input_features.n_frames << " frames\n";
+    m_last_feature_extract_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_fe_0).count();
     size_t segment_offset = 0;
 
     OPENVINO_ASSERT(m_feature_extractor.sampling_rate != 0, "Sampling Rate for Feature Extractor is 0");
@@ -485,39 +496,57 @@ std::vector<std::pair<ov::Tensor, ov::Tensor>> SpeechEncoder::encode(const RawSp
                         input_features_chunk.size(),
                         ".");
         ov::Tensor input_tensor(ov::element::f32, {1, m_feature_extractor.feature_size, m_feature_extractor.nb_max_frames}, input_features_chunk.data());
-        m_encoder.set_tensor("input_features", input_tensor);
-        std::cout << "Running inference for chunk at offset " << chunk_offset << "\n";
-        m_encoder.infer();
-        std::cout << "Encoder inference completed\n";
 
-        // reset input tensor
-        auto devices = m_encoder.get_compiled_model().get_property(ov::execution_devices);
-        OPENVINO_ASSERT(devices.size() > 0, "No execution devices found!");
-        size_t batch_size = (devices[0] == "NPU") ? 1 : 0;
-        m_encoder.set_tensor("input_features", ov::Tensor(ov::element::f32, {batch_size, m_feature_extractor.feature_size, m_feature_extractor.nb_max_frames}));
+        // Acquire an InferRequest from the pool (blocks if all are busy).
+        // Each concurrent encode() caller gets its own request, allowing true
+        // parallel encoder inference when THROUGHPUT mode creates multiple streams.
+        ov::Tensor encoder_hidden_state;
+        {
+            CircularBufferQueueElementGuard<ov::InferRequest> ireq_guard(m_encoder_pool.get());
+            ov::InferRequest& ireq = ireq_guard.get();
 
-        ov::Tensor encoder_hidden_state = m_encoder.get_tensor("last_hidden_state");
+            ireq.set_tensor("input_features", input_tensor);
+            {
+                const auto t_enc0 = std::chrono::steady_clock::now();
+                ireq.infer();
+                m_last_encoder_infer_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_enc0).count();
+            }
+
+            // Reset input tensor to free the memory before returning to pool.
+            auto devices = ireq.get_compiled_model().get_property(ov::execution_devices);
+            OPENVINO_ASSERT(devices.size() > 0, "No execution devices found!");
+            size_t batch_size = (devices[0] == "NPU") ? 1 : 0;
+            ireq.set_tensor("input_features", ov::Tensor(ov::element::f32, {batch_size, m_feature_extractor.feature_size, m_feature_extractor.nb_max_frames}));
+
+            // Deep-copy the hidden state before releasing the infer request back
+            // to the pool.  The tensor returned by get_tensor() shares its buffer
+            // with the InferRequest; another thread could overwrite it as soon as
+            // the guard destructs, so we must own an independent copy.
+            auto raw_hs = ireq.get_tensor("last_hidden_state");
+            encoder_hidden_state = ov::Tensor(raw_hs.get_element_type(), raw_hs.get_shape());
+            raw_hs.copy_to(encoder_hidden_state);
+        }  // ireq_guard destructs here — ireq returned to pool
 
         ov::genai::RawPerfMetrics raw_metrics;
-        auto init_tokens = prepare_sot_tokens(encoder_hidden_state, m_decoder, config, raw_metrics);
-        std::vector<int64_t> chunk_init_tokens = ov::genai::get_prompt_tokens(context_tokens, config, chunk_offset);
-        chunk_init_tokens.insert(chunk_init_tokens.end(), init_tokens.begin(), init_tokens.end());
-        
-        // IMPORTANT: Must copy data, not create a view with pointer to local vector!
-        // The local vector chunk_init_tokens will be destroyed, creating a dangling pointer
-        ov::Tensor input_ids{ov::element::i64, {1, chunk_init_tokens.size()}};
-        std::memcpy(input_ids.data<int64_t>(), chunk_init_tokens.data(), chunk_init_tokens.size() * sizeof(int64_t));
-        
-        std::cout << "Created input_ids tensor with " << chunk_init_tokens.size() << " tokens: ";
-        for (size_t i = 0; i < chunk_init_tokens.size(); ++i) {
-            std::cout << chunk_init_tokens[i] << " ";
-        }
-        std::cout << "\n";
+        {
+            // prepare_sot_tokens uses the shared decoder; serialize with m_decoder_mutex.
+            std::lock_guard<std::mutex> dec_lock(m_decoder_mutex);
+            const auto t_sot_0 = std::chrono::steady_clock::now();
+            auto init_tokens = prepare_sot_tokens(encoder_hidden_state, m_decoder, config, raw_metrics);
+            m_last_sot_tokens_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sot_0).count();
+            std::vector<int64_t> chunk_init_tokens = ov::genai::get_prompt_tokens(context_tokens, config, chunk_offset);
+            chunk_init_tokens.insert(chunk_init_tokens.end(), init_tokens.begin(), init_tokens.end());
 
-        decoder_inputs.emplace_back(std::make_pair(input_ids, encoder_hidden_state));
+            // IMPORTANT: Must copy data, not create a view with pointer to local vector!
+            // The local vector chunk_init_tokens will be destroyed, creating a dangling pointer
+            ov::Tensor input_ids{ov::element::i64, {1, chunk_init_tokens.size()}};
+            std::memcpy(input_ids.data<int64_t>(), chunk_init_tokens.data(), chunk_init_tokens.size() * sizeof(int64_t));
+
+            decoder_inputs.emplace_back(std::make_pair(input_ids, encoder_hidden_state));
+        }
         segment_offset = input_features.n_frames;
     }
-    std::cout << "SpeechEncoder::encode completed, returning " << decoder_inputs.size() << " chunks\n";
     return decoder_inputs;
 }
 
