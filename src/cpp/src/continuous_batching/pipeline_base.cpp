@@ -573,6 +573,24 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::encode_speech(
     const RawSpeechInput& raw_speech,
     const WhisperGenerationConfig& config) {
     OPENVINO_ASSERT(m_speech_encoder, "encode_speech() requires a Whisper pipeline with a speech encoder");
+
+    // SKIP_ENCODING=1: return cached output for all calls after the first.
+    // This isolates decoder throughput from encoder latency for benchmarking.
+    static const bool s_skip_encoding = [] {
+        const char* v = std::getenv("SKIP_ENCODING");
+        return v && std::string(v) == "1";
+    }();
+
+    if (s_skip_encoding && m_cached_encoder_hidden_states) {
+        ov::Tensor input_ids(m_cached_encoder_input_ids.get_element_type(),
+                             m_cached_encoder_input_ids.get_shape());
+        ov::Tensor encoder_hs(m_cached_encoder_hidden_states.get_element_type(),
+                              m_cached_encoder_hidden_states.get_shape());
+        m_cached_encoder_input_ids.copy_to(input_ids);
+        m_cached_encoder_hidden_states.copy_to(encoder_hs);
+        return {input_ids, encoder_hs};
+    }
+
     auto [context_tokens, tokenization_duration_microseconds] = prepare_context_tokens(config, m_tokenizer);
     // encode() is now thread-safe: SpeechEncoder uses a pool of InferRequests
     // (compiled with THROUGHPUT hint) so concurrent callers each get their own
@@ -585,7 +603,21 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::encode_speech(
         m_last_feature_extract_ms = m_speech_encoder->get_last_feature_extract_ms();
         m_last_sot_tokens_ms      = m_speech_encoder->get_last_sot_tokens_ms();
     }
-    return {decoder_inputs[0].first, decoder_inputs[0].second};
+    ov::Tensor input_ids = decoder_inputs[0].first;
+    ov::Tensor encoder_hs = decoder_inputs[0].second;
+
+    if (s_skip_encoding) {
+        // First call — stash deep copies for subsequent requests.
+        m_cached_encoder_input_ids = ov::Tensor(input_ids.get_element_type(), input_ids.get_shape());
+        m_cached_encoder_hidden_states = ov::Tensor(encoder_hs.get_element_type(), encoder_hs.get_shape());
+        input_ids.copy_to(m_cached_encoder_input_ids);
+        encoder_hs.copy_to(m_cached_encoder_hidden_states);
+        std::cout << "[SKIP_ENCODING] Encoder output cached for reuse ("
+                  << encoder_hs.get_size() * encoder_hs.get_element_type().size()
+                  << " bytes)\n";
+    }
+
+    return {input_ids, encoder_hs};
 }
 
 GenerationHandle
@@ -597,44 +629,9 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(
     m_whisper_gen_config = sampling_params;
     m_has_whisper_config = true;
 
-    // Run speech through the encoder to get hidden states for the decoder.
-    // When SKIP_ENCODING=1 the encoder is run only on the first request; all
-    // subsequent requests reuse the cached output.  This isolates decoder
-    // throughput from encoder latency for benchmarking purposes.
-    const bool skip_encoding = [] {
-        const char* v = std::getenv("SKIP_ENCODING");
-        return v && std::string(v) == "1";
-    }();
+    // encode_speech() handles SKIP_ENCODING caching internally.
+    auto [input_ids, encoder_hidden_states] = encode_speech(raw_speech, sampling_params);
 
-    ov::Tensor input_ids, encoder_hidden_states;
-
-    if (skip_encoding && m_cached_encoder_hidden_states) {
-        // Reuse previously computed encoder output (deep copies so each request
-        // gets its own independent tensor that the CB pipeline can freely modify).
-        input_ids             = ov::Tensor(m_cached_encoder_input_ids.get_element_type(),
-                                           m_cached_encoder_input_ids.get_shape());
-        encoder_hidden_states = ov::Tensor(m_cached_encoder_hidden_states.get_element_type(),
-                                           m_cached_encoder_hidden_states.get_shape());
-        m_cached_encoder_input_ids.copy_to(input_ids);
-        m_cached_encoder_hidden_states.copy_to(encoder_hidden_states);
-    } else {
-        auto [ids, hs] = encode_speech(raw_speech, sampling_params);
-        input_ids             = ids;
-        encoder_hidden_states = hs;
-
-        if (skip_encoding) {
-            // First call — stash a deep copy so future requests can skip encoding.
-            m_cached_encoder_input_ids = ov::Tensor(input_ids.get_element_type(),
-                                                    input_ids.get_shape());
-            m_cached_encoder_hidden_states = ov::Tensor(encoder_hidden_states.get_element_type(),
-                                                        encoder_hidden_states.get_shape());
-            input_ids.copy_to(m_cached_encoder_input_ids);
-            encoder_hidden_states.copy_to(m_cached_encoder_hidden_states);
-            std::cout << "[SKIP_ENCODING] Encoder output cached for reuse ("
-                      << encoder_hidden_states.get_size() * encoder_hidden_states.get_element_type().size()
-                      << " bytes)\n";
-        }
-    }
     if (cb_verbose()) {
         std::cout << "Calling internal add_request with input_ids shape: ";
         for (const auto& dim : input_ids.get_shape()) {

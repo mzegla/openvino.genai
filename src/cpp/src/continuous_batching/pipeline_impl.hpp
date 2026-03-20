@@ -50,6 +50,19 @@ protected:
     // Cross-attention K/V slot buffer. Created lazily on first admit() call.
     std::unique_ptr<CrossKVCache> m_cross_kv_cache;
 
+    // Pending cross-KV projections: requests whose encoder hidden states are
+    // ready but whose K/V projection hasn't been run yet.  Populated by
+    // add_request() and drained by _flush_pending_projections() at the start
+    // of each step() call.  The projection of all pending requests is batched
+    // into a single projector infer() for efficiency.
+    struct PendingProjection {
+        uint64_t req_id;
+        ov::Tensor encoder_hidden_states;
+        std::shared_ptr<SequenceGroup> sequence_group;
+    };
+    std::vector<PendingProjection> m_pending_proj_queue;
+    mutable std::mutex m_pending_proj_mutex;
+
     // Pre-allocated per-layer storages for the per-token cache re-rotation deltas used in cache eviction case
     std::vector<ov::Tensor> m_rotation_deltas_stores;
 
@@ -79,6 +92,15 @@ protected:
      * Should be called within each call of step()
      */
     virtual void _pull_awaiting_requests();
+
+    /**
+     * Batch-projects all pending encoder hidden states through the cross-attention
+     * projector in a single infer() call and admits the resulting K/V tensors to
+     * the CrossKVCache slot buffer.  Called at the start of each step() so that
+     * projection and decode overlap across consecutive steps.
+     * Only processes as many requests as there are free slots — never blocks.
+     */
+    void _flush_pending_projections();
 
     /**
      * Releases non-running (finished, dropped or OOM) requests from running queue

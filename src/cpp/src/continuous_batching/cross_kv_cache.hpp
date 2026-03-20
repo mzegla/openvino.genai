@@ -159,6 +159,89 @@ public:
     }
 
     // -------------------------------------------------------------------
+    // n_free_slots(): number of slots available right now.
+    // Called from step() thread before _flush_pending_projections() to
+    // decide how many requests can be batch-projected without blocking.
+    // -------------------------------------------------------------------
+    size_t n_free_slots() const {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        return m_free_slots.size();
+    }
+
+    // -------------------------------------------------------------------
+    // add_proj_infer_us(): accumulate external projector timing into the
+    // internal counter so get_proj_infer_us() stays accurate when
+    // projection is handled outside CrossKVCache (batched path).
+    // -------------------------------------------------------------------
+    void add_proj_infer_us(double us) {
+        std::lock_guard<std::mutex> plk(m_proj_mutex);
+        m_proj_infer_us += us;
+    }
+
+    // -------------------------------------------------------------------
+    // admit_precomputed_batch(): store per-request K/V slices from a single
+    // batched projector run into their allocated slots.
+    //
+    // Precondition: m_proj_infer_request.infer() was already called with a
+    // [N, T_enc, D] input; outputs have shape [N, n_heads, T_enc, head_dim].
+    // Precondition: at least N free slots are available (caller must have
+    // checked n_free_slots() >= N before calling — no blocking occurs here).
+    // Must be called from the step() thread (non-blocking by design).
+    // -------------------------------------------------------------------
+    void admit_precomputed_batch(const std::vector<uint64_t>& req_ids,
+                                 ov::InferRequest& proj_req) {
+        const size_t N = req_ids.size();
+        if (N == 0) return;
+        const size_t n_elems = _slot_elem_count();
+
+        // Pre-extract all layer output data pointers — single-threaded, safe.
+        // Avoids calling get_tensor() from multiple threads simultaneously.
+        struct LayerPtrs { const uint8_t* K; const uint8_t* V; };
+        std::vector<LayerPtrs> layer_ptrs(m_n_layers);
+        for (size_t l = 0; l < m_n_layers; ++l) {
+            layer_ptrs[l].K = static_cast<const uint8_t*>(
+                proj_req.get_tensor("cross_proj_K_" + std::to_string(l)).data());
+            layer_ptrs[l].V = static_cast<const uint8_t*>(
+                proj_req.get_tensor("cross_proj_V_" + std::to_string(l)).data());
+        }
+
+        // Phase 1: assign ALL N slots under a single lock acquisition.
+        std::vector<uint32_t> slots(N);
+        {
+            std::unique_lock<std::mutex> lk(m_mutex);
+            OPENVINO_ASSERT(m_free_slots.size() >= N,
+                "admit_precomputed_batch: not enough free slots — caller must check n_free_slots()");
+            for (size_t i = 0; i < N; ++i) {
+                slots[i] = m_free_slots.back();
+                m_free_slots.pop_back();
+                m_req_to_slot[req_ids[i]] = slots[i];
+            }
+            std::cout << "[CrossKVCache] Batch-admitted " << N << " reqs"
+                      << " (active=" << m_req_to_slot.size() << "/" << m_max_slots << ")\n";
+        }
+
+        // Phase 2: parallel scatter — one async task per request.
+        // Each task copies all layers for one request directly from projector
+        // output to slot buffer.  No temporary tensors, one copy not two,
+        // N tasks run in parallel saturating DRAM write bandwidth.
+        const size_t src_stride = n_elems * m_elem_type.size();
+        std::vector<std::future<void>> futs;
+        futs.reserve(N);
+        for (size_t i = 0; i < N; ++i) {
+            futs.push_back(std::async(std::launch::async,
+                [this, i, &slots, &layer_ptrs, src_stride, n_elems]() {
+                    for (size_t l = 0; l < m_n_layers; ++l) {
+                        _store_to_slot(layer_ptrs[l].K + i * src_stride,
+                                       _slot_ptr(l, 0, slots[i]), n_elems);
+                        _store_to_slot(layer_ptrs[l].V + i * src_stride,
+                                       _slot_ptr(l, 1, slots[i]), n_elems);
+                    }
+                }));
+        }
+        for (auto& f : futs) f.get();
+    }
+
+    // -------------------------------------------------------------------
     // release(): return the slot for req_id to the free list.
     // No data movement — O(1) bookkeeping only.
     // Called from main pipeline thread. Notifies any blocked admit() calls.
@@ -233,16 +316,28 @@ public:
                     m_alias1_kv[l][1] = ov::Tensor(m_elem_type, shape1, m_conv1_V[l].data());
                 }
             }
-            // Need set_tensor only when transitioning from N>1 to N=1
-            out_need_set_tensor = (m_last_set_tensor_N != 1);
-            if (out_need_set_tensor) m_last_set_tensor_N = 1;
+            // Need set_tensor when N changes (N>1 → N=1) OR when the request changes at N=1.
+            // The latter handles staggered injection: prompt_needs_solo fires two consecutive
+            // N=1 forward passes in the same step (one per request). Without tracking req_id,
+            // the second pass sees m_last_set_tensor_N==1 and skips set_tensor, leaving OV
+            // with the first request's stale K/V tensors bound for the second request's decode.
+            out_need_set_tensor = (m_last_set_tensor_N != 1) || (req_ids[0] != m_last1_req_id);
+            if (out_need_set_tensor) {
+                m_last_set_tensor_N = 1;
+                m_last1_req_id = req_ids[0];
+            }
             return m_alias1_kv;
         }
 
         // ---------------------------------------------------------------
-        // N>1 fast path: identical batch → nothing to do.
+        // N>1 fast path: identical batch AND shape already set → nothing to do.
+        // Must also check m_last_set_tensor_N == N to guard against the case where
+        // m_last_req_ids matches (leftover from a prior scenario or prior step) but
+        // the OV tensor binding was downgraded to N=1 by intervening solo steps.
+        // Without the shape guard, OV would use the stale N=1 tensor and every
+        // sequence above index 0 would read the first request's K/V.
         // ---------------------------------------------------------------
-        if (req_ids == m_last_req_ids) {
+        if (req_ids == m_last_req_ids && m_last_set_tensor_N == N) {
             out_need_set_tensor = false;
             return m_alias_kv;
         }
@@ -378,6 +473,10 @@ private:
     std::vector<uint64_t> m_last_req_ids;
     // Last N for which set_tensor was actually called; set_tensor skipped when N is stable.
     size_t m_last_set_tensor_N = 0;
+    // Last request ID for which set_tensor was called in the N=1 path.
+    // Used to detect request changes at N=1 (e.g. prompt_needs_solo: A-solo then B-solo
+    // in the same step), where N stays 1 but the request — and therefore its K/V slot — changes.
+    uint64_t m_last1_req_id = static_cast<uint64_t>(-1);
 
     // -------------------------------------------------------------------
     // Helpers

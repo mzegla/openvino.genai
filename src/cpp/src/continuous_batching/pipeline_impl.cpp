@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <atomic>
+#include <chrono>
+#include <iomanip>
 #include <thread>
 #include <optional>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <set>
@@ -1482,6 +1485,64 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_pull_awaiting_requests
     m_pipeline_metrics.requests = m_requests.size();
 }
 
+void ContinuousBatchingPipeline::ContinuousBatchingImpl::_flush_pending_projections() {
+    // How many requests can we admit without blocking?
+    const size_t n_free = m_cross_kv_cache->n_free_slots();
+    if (n_free == 0) return;
+
+    // Take up to n_free requests from the pending queue.
+    std::vector<PendingProjection> batch;
+    {
+        std::lock_guard<std::mutex> pl(m_pending_proj_mutex);
+        if (m_pending_proj_queue.empty()) return;
+        const size_t n_take = std::min(n_free, m_pending_proj_queue.size());
+        batch.assign(m_pending_proj_queue.begin(),
+                     m_pending_proj_queue.begin() + static_cast<ptrdiff_t>(n_take));
+        m_pending_proj_queue.erase(m_pending_proj_queue.begin(),
+                                   m_pending_proj_queue.begin() + static_cast<ptrdiff_t>(n_take));
+    }
+
+    const size_t N = batch.size();
+
+    const auto& ref_shape = batch[0].encoder_hidden_states.get_shape();
+    OPENVINO_ASSERT(ref_shape.size() == 3,
+        "_flush_pending_projections: expected encoder_hidden_states shape [1, T_enc, D]");
+    const size_t T_enc = ref_shape[1];
+    const size_t D     = ref_shape[2];
+    const auto hs_type = batch[0].encoder_hidden_states.get_element_type();
+
+    std::vector<uint64_t> req_ids;
+    req_ids.reserve(N);
+    for (auto& p : batch) req_ids.push_back(p.req_id);
+
+    // Stack N encoder hidden states into [N, T_enc, D] and run the projector once.
+    // Batching amortises the kernel launch cost; N parallel slot writes follow.
+    const size_t slice_bytes = T_enc * D * hs_type.size();
+    ov::Tensor batched_hs(hs_type, {N, T_enc, D});
+    uint8_t* dst = static_cast<uint8_t*>(batched_hs.data());
+    for (size_t i = 0; i < N; ++i)
+        std::memcpy(dst + i * slice_bytes, batch[i].encoder_hidden_states.data(), slice_bytes);
+
+    m_proj_infer_request.set_tensor("encoder_hidden_states", batched_hs);
+    const auto t0 = std::chrono::steady_clock::now();
+    m_proj_infer_request.infer();
+    const double proj_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - t0).count();
+    m_cross_kv_cache->add_proj_infer_us(proj_us);
+    m_cross_kv_cache->admit_precomputed_batch(req_ids, m_proj_infer_request);
+    std::cout << "[flush] batch N=" << N << " proj=" << std::fixed
+              << std::setprecision(1) << proj_us / 1000.0 << " ms\n";
+
+    // Assign slot IDs and push sequence groups to the awaiting queue.
+    {
+        std::lock_guard<std::mutex> lock(m_awaiting_requests_mutex);
+        for (auto& p : batch) {
+            p.sequence_group->set_cross_kv_slot_id(m_cross_kv_cache->slot_of(p.req_id));
+            m_awaiting_requests.push_back(p.sequence_group);
+        }
+    }
+}
+
 void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(
     std::shared_ptr<ov::Model> model,
     const SchedulerConfig& scheduler_config,
@@ -1632,10 +1693,24 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(
         const char* kv_env = std::getenv("CROSS_KV_CACHE");
         const bool cross_kv_enabled = !(kv_env && std::string(kv_env) == "0");
         if (cross_kv_enabled) {
+            // Make the batch dimension dynamic so _flush_pending_projections() can
+            // run the projector with [N, T_enc, D] input for N ≥ 1.
+            {
+                std::map<std::string, ov::PartialShape> dyn_batch_map;
+                for (auto& inp : m_projector_model->inputs()) {
+                    auto ps = inp.get_partial_shape();
+                    // Always make batch dimension (dim 0) dynamic, regardless of
+                    // whether other dims are already dynamic (e.g. T_enc is already ?).
+                    if (ps.size() >= 1)
+                        ps[0] = ov::Dimension();  // dynamic batch
+                    dyn_batch_map[inp.get_any_name()] = ps;
+                }
+                m_projector_model->reshape(dyn_batch_map);
+            }
             // Compile projector and stash the InferRequest.
             // CrossKVCache is constructed lazily on the first admit() call once we have
             // a real encoder_hidden_state and can read concrete output shapes.
-            if (cb_verbose()) std::cout << "[CrossKV] Compiling projector model...\n";
+            if (cb_verbose()) std::cout << "[CrossKV] Compiling projector model (dynamic batch)...\n";
             ov::CompiledModel proj_compiled =
                 utils::singleton_core().compile_model(m_projector_model, device, *filtered_properties);
             m_proj_infer_request = proj_compiled.create_infer_request();
@@ -1790,19 +1865,14 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request(
             }
             std::cout << "[request " << request_id << "] added, prompt_len=" << prompt_len << "\n";
         } else {
-            // Admit asynchronously: admit() may block waiting for a free slot.
-            // Running it on the pipeline thread would deadlock (release() is also
-            // called from the pipeline step loop on this same thread).
-            ov::Tensor enc_hs_copy = *encoder_hidden_state;  // ref-counted shallow copy
-            std::thread([this, request_id, enc_hs_copy, sequence_group]() mutable {
-                m_cross_kv_cache->admit(request_id, enc_hs_copy);
-                sequence_group->set_cross_kv_slot_id(m_cross_kv_cache->slot_of(request_id));
-                {
-                    std::lock_guard<std::mutex> lock{m_awaiting_requests_mutex};
-                    m_awaiting_requests.push_back(sequence_group);
-                }
-                std::cout << "[request " << request_id << "] admitted + queued (async)\n";
-            }).detach();
+            // Projection is batched in _flush_pending_projections() called from step().
+            // Push to pending queue so the step loop handles it without blocking add_request().
+            {
+                std::lock_guard<std::mutex> pl(m_pending_proj_mutex);
+                m_pending_proj_queue.push_back({request_id, *encoder_hidden_state, sequence_group});
+            }
+            // sequence_group is pushed to m_awaiting_requests by _flush_pending_projections()
+            // after projection completes — do NOT push it here.
         }
     } else {
         {
@@ -1850,13 +1920,23 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request(uint64_t request
 
 bool ContinuousBatchingPipeline::ContinuousBatchingImpl::has_non_finished_requests() {
     std::lock_guard<std::mutex> lock{m_awaiting_requests_mutex};
-    return !m_awaiting_requests.empty() || !m_requests.empty();
+    if (!m_awaiting_requests.empty() || !m_requests.empty())
+        return true;
+    // Also check for requests whose projection hasn't run yet.
+    std::lock_guard<std::mutex> pl(m_pending_proj_mutex);
+    return !m_pending_proj_queue.empty();
 }
 
 void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
     static ManualTimer step_timer("step()");
     static size_t step_idx = 0;
     step_timer.start();
+
+    // Batch-project any pending encoder hidden states and admit them to the
+    // CrossKVCache slot buffer.  Done before _pull_awaiting_requests() so that
+    // requests whose K/V is now ready get pulled into the scheduler this step.
+    if (m_cross_kv_cache)
+        _flush_pending_projections();
 
     _pull_awaiting_requests();
 
