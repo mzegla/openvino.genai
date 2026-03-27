@@ -35,6 +35,7 @@ struct RequestMetrics {
     double sot_tokens_ms = 0.0;          // prepare_sot_tokens time (both modes)
     std::string text;  // Output text for correctness validation (native mode)
     std::vector<int64_t> tokens;  // Output tokens for correctness validation (CB mode)
+    size_t num_output_tokens = 0;  // Generated (output) token count — used for tok/s throughput
 };
 
 struct PendingRequest {
@@ -47,6 +48,7 @@ class DynamicBenchmark {
 private:
     std::string model_path;
     std::string device;
+    ov::element::Type kv_cache_precision{ov::element::dynamic};  // dynamic = use plugin default
     ov::genai::RawSpeechInput base_audio;
     ov::genai::WhisperGenerationConfig config;
     bool is_native_mode;
@@ -66,11 +68,13 @@ private:
     std::mutex metrics_mutex;
     
 public:
-    DynamicBenchmark(const std::string& model_path, const std::string& device, 
+    DynamicBenchmark(const std::string& model_path, const std::string& device,
                      const ov::genai::RawSpeechInput& audio,
                      const ov::genai::WhisperGenerationConfig& config,
-                     bool is_native)
-        : model_path(model_path), device(device), base_audio(audio), config(config),
+                     bool is_native,
+                     ov::element::Type kv_prec = ov::element::dynamic)
+        : model_path(model_path), device(device), kv_cache_precision(kv_prec),
+          base_audio(audio), config(config),
           is_native_mode(is_native), tokenizer(model_path) {}
     
     void request_generator(double request_rate, double duration_seconds) {
@@ -174,6 +178,7 @@ public:
                 // Compute encoder component timings from perf_metrics
                 {
                     const auto& raw = result.perf_metrics.raw_metrics;
+                    metrics_entry.num_output_tokens = raw.m_new_token_times.size();
                     double total_infer_ms = raw.m_inference_durations.empty() ? 0.0
                         : raw.m_inference_durations[0].count() / 1000.0;
                     double decoder_infer_ms = 0.0;
@@ -201,7 +206,9 @@ public:
     
     // Called from run() before the generator starts — builds and warms up the CB pipeline.
     std::unique_ptr<ov::genai::ContinuousBatchingPipeline> setup_cb_pipeline() {
-        ov::AnyMap pipe_properties{{ov::hint::kv_cache_precision.name(), ov::element::bf16}};
+        ov::AnyMap pipe_properties;
+        if (kv_cache_precision != ov::element::dynamic)
+            pipe_properties[ov::hint::kv_cache_precision.name()] = kv_cache_precision;
         ov::genai::SchedulerConfig sched_cfg;
         sched_cfg.max_num_batched_tokens = 100;
         sched_cfg.max_num_tokens_per_prefill_step = 1;
@@ -360,6 +367,7 @@ public:
                     m.feature_extract_ms = it->feature_extract_ms;
                     m.sot_tokens_ms      = it->sot_tokens_ms;
                     m.tokens = std::move(it->tokens);
+                    m.num_output_tokens  = m.tokens.size();
                     {
                         std::lock_guard<std::mutex> lock(metrics_mutex);
                         metrics.push_back(std::move(m));
@@ -550,6 +558,10 @@ public:
             : std::accumulate(sot_tokens_times.begin(), sot_tokens_times.end(), 0.0) / sot_tokens_times.size();
         
         double throughput = metrics.size() / total_duration_seconds;
+        size_t total_output_tokens = 0;
+        for (const auto& m : metrics)
+            total_output_tokens += m.num_output_tokens;
+        double token_throughput = total_output_tokens / total_duration_seconds;
 
         // Correctness validation first — tokenizer.decode() emits [OV-DBG] lines to
         // stdout, so run this section before printing the summary numbers so the
@@ -698,6 +710,10 @@ public:
         std::cout << "Completed requests: " << completed_requests.load() << "\n";
         std::cout << "Success rate: " << (100.0 * completed_requests / scheduled_requests) << "%\n";
         std::cout << "Throughput: " << throughput << " req/s\n";
+        if (total_output_tokens > 0)
+            std::cout << "Token throughput: " << std::setprecision(1) << token_throughput
+                      << " output tok/s  (" << total_output_tokens << " tokens / "
+                      << std::setprecision(2) << total_duration_seconds << " s)\n";
         std::cout << "\n--- Latency Statistics (ms) ---\n";
         std::cout << "Average: " << avg_latency << " ms\n";
         std::cout << "Median (p50): " << percentile(latencies, 0.50) << " ms\n";
@@ -793,7 +809,7 @@ public:
 
 int main(int argc, char* argv[]) try {
     if (argc < 5) {
-        std::cerr << "Usage: " << argv[0] << " <model_path> <audio_file> <request_rate> <duration_seconds> [device] [--is-native] [--burst N]\n";
+        std::cerr << "Usage: " << argv[0] << " <model_path> <audio_file> <request_rate> <duration_seconds> [device] [--is-native] [--burst N] [--kv-cache-precision f32|bf16]\n";
         std::cerr << "  model_path: Path to the Whisper model directory\n";
         std::cerr << "  audio_file: Path to the WAV audio file\n";
         std::cerr << "  request_rate: Number of requests per second (e.g., 2.0)\n";
@@ -801,10 +817,12 @@ int main(int argc, char* argv[]) try {
         std::cerr << "  device: Optional device (default: CPU)\n";
         std::cerr << "  --is-native: Use native WhisperPipeline (sequential) instead of continuous batching\n";
         std::cerr << "  --burst N: Add all N requests at once (ignores request_rate and duration_seconds)\n";
+        std::cerr << "  --kv-cache-precision f32|bf16: Override KV-cache precision (default: plugin decides)\n";
         std::cerr << "\nExamples:\n";
         std::cerr << "  Continuous batching: " << argv[0] << " ./whisper-base-openvino ./sample.wav 2.0 30\n";
         std::cerr << "  Native sequential:   " << argv[0] << " ./whisper-base-openvino ./sample.wav 2.0 30 CPU --is-native\n";
         std::cerr << "  Burst (CB):          " << argv[0] << " ./whisper-base-openvino ./sample.wav 0 0 CPU --burst 10\n";
+        std::cerr << "  Force f32 KV:        " << argv[0] << " ./whisper-base-openvino ./sample.wav 2.0 30 CPU --kv-cache-precision f32\n";
         return EXIT_FAILURE;
     }
     
@@ -817,6 +835,7 @@ int main(int argc, char* argv[]) try {
     std::string device = "CPU";
     bool is_native_mode = false;
     int burst_count = -1;  // -1 means not set
+    ov::element::Type kv_cache_precision = ov::element::dynamic;  // dynamic = plugin decides
     
     for (int i = 5; i < argc; ++i) {
         std::string arg = argv[i];
@@ -830,6 +849,18 @@ int main(int argc, char* argv[]) try {
             burst_count = std::stoi(argv[++i]);
             if (burst_count <= 0) {
                 std::cerr << "Error: --burst count must be positive\n";
+                return EXIT_FAILURE;
+            }
+        } else if (arg == "--kv-cache-precision") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --kv-cache-precision requires f32 or bf16\n";
+                return EXIT_FAILURE;
+            }
+            std::string prec = argv[++i];
+            if (prec == "f32")       kv_cache_precision = ov::element::f32;
+            else if (prec == "bf16") kv_cache_precision = ov::element::bf16;
+            else {
+                std::cerr << "Error: --kv-cache-precision must be f32 or bf16\n";
                 return EXIT_FAILURE;
             }
         } else if (i == 5 && arg[0] != '-') {  // First optional positional arg is device
@@ -858,12 +889,12 @@ int main(int argc, char* argv[]) try {
     }
     config.language = "<|en|>";
     config.task = "transcribe";
-    config.return_timestamps = true;
-    config.word_timestamps = false;  // CB pipeline doesn't produce word-level timestamps
+    config.return_timestamps = false;  // disabled for apples-to-apples comparison with vLLM
+    config.word_timestamps = false;
     config.max_new_tokens = 50;
 
     // Run benchmark
-    DynamicBenchmark benchmark(models_path, device, raw_speech, config, is_native_mode);
+    DynamicBenchmark benchmark(models_path, device, raw_speech, config, is_native_mode, kv_cache_precision);
     if (burst_count > 0) {
         benchmark.run_burst(static_cast<size_t>(burst_count));
     } else {

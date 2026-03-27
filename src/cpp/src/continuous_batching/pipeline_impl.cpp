@@ -1990,7 +1990,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
         const auto infer_start = std::chrono::steady_clock::now();
         timer.start();
 
-        // Three-way split: PROMPT / TRANSITION / GENERATE forward() passes.
+        // Two-pass split: PROMPT separate, TRANSITION+GENERATE batched together.
         //
         // Phase definitions (context_len = processed + scheduled, prompt_len = #SOT tokens):
         //   PROMPT     – !requires_sampling()              (context_len < prompt_len)
@@ -1998,27 +1998,21 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
         //                  processing the last SOT token; produces the first generated token)
         //   GENERATE   – can_generate_tokens()             (context_len > prompt_len)
         //
-        // Root causes for mixing phases in one forward():
-        //   1. PROMPT + GENERATE/TRANSITION: sampler offset corruption + KV contamination.
-        //      PROMPT groups have output_seq_len=0 so the sampler offset logic is wrong when
-        //      they remain is_scheduled()==true.  PagedAttention also writes fresh PROMPT KV
-        //      entries while simultaneously reading stale GENERATE KV entries in the same batch.
-        //   2. TRANSITION + GENERATE: TRANSITION computes its first token logit in a batch
-        //      that includes GENERATE queries.  Those GENERATE queries have accumulated KV
-        //      context from prior generation steps; TRANSITION has not.  The segmented
-        //      cross-attention and self-attention interact over an inconsistent KV context,
-        //      corrupting the TRANSITION group's first-token logit (wrong text tokens or
-        //      hallucinated timestamp-repeat loops).
+        // Root cause for keeping PROMPT separate:
+        //   PROMPT + TRANSITION/GENERATE in the same forward() causes sampler offset corruption
+        //   and KV contamination: PROMPT groups have output_seq_len=0 so the sampler offset
+        //   logic is wrong when they remain is_scheduled()==true.  PagedAttention also writes
+        //   fresh PROMPT KV entries while simultaneously reading stale GENERATE KV entries.
         //
-        // Solution: three separate forward() passes, one per phase.
-        //   Pass 1 (PROMPT):     write KV, discard logits, finish_iteration() immediately.
-        //   Pass 2 (TRANSITION): solo forward, deep-copy logits (forward() returns a VIEW
-        //                        into the infer-request buffer; Pass 3 would alias it).
-        //   Pass 3 (GENERATE):   solo forward, use logits directly (last forward call).
+        // TRANSITION and GENERATE are safe to batch together:
+        //   Both produce exactly one logit row per sequence (max_num_tokens_per_prefill_step=1
+        //   ensures T=1 for all phases).  PA handles heterogeneous past_lens by design, and
+        //   the segmented cross-attention slot assignment is per-request regardless of decode
+        //   position.  Batching eliminates one forward() call per request entering GENERATE.
         //
-        // After Passes 2+3, logit rows are assembled into one tensor in ascending sg_id
-        // order (= sampler iteration order over m_requests) using byte-accurate memcpy
-        // keyed on elem_type.size() so both f32 and bf16 models are handled correctly.
+        // Solution: two passes.
+        //   Pass 1 (PROMPT):              write KV, discard logits, finish_iteration() immediately.
+        //   Pass 2 (TRANSITION+GENERATE): one batched forward, use logits directly.
         std::vector<uint64_t> prompt_ids, trans_ids, gen_ids;
         for (uint64_t sg_id : scheduler_output.m_scheduled_sequence_groups_ids) {
             auto& sg = m_requests[sg_id];

@@ -538,6 +538,13 @@ std::vector<std::pair<ov::Tensor, ov::Tensor>> SpeechEncoder::encode(const RawSp
             std::vector<int64_t> chunk_init_tokens = ov::genai::get_prompt_tokens(context_tokens, config, chunk_offset);
             chunk_init_tokens.insert(chunk_init_tokens.end(), init_tokens.begin(), init_tokens.end());
 
+            // Mirror the native whisper_generate() path: when not generating timestamps,
+            // append <|notimestamps|> to the SOT prompt so the model does not generate it
+            // as an output token (which would inflate output token counts by 1/request).
+            if (!config.return_timestamps) {
+                chunk_init_tokens.push_back(config.no_timestamps_token_id);
+            }
+
             // IMPORTANT: Must copy data, not create a view with pointer to local vector!
             // The local vector chunk_init_tokens will be destroyed, creating a dangling pointer
             ov::Tensor input_ids{ov::element::i64, {1, chunk_init_tokens.size()}};

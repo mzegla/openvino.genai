@@ -19,7 +19,18 @@
 
 #include "openvino/runtime/core.hpp"
 #include "openvino/runtime/infer_request.hpp"
+#include "openvino/runtime/remote_context.hpp"
 #include "openvino/runtime/tensor.hpp"
+
+// GPU-side gather kernel: eliminates the per-batch-change PCIe blit by keeping
+// the cross-KV slot buffer in VRAM and scattering with an OpenCL kernel.
+// Compiled when cmake finds OpenCL (ENABLE_CROSS_KV_OCL is defined).
+// Uses only raw C OpenCL API (CL/cl.h) + OV's RemoteContext property headers;
+// no dependency on C++ wrapper headers (CL/opencl.hpp / CL/cl2.hpp).
+#ifdef ENABLE_CROSS_KV_OCL
+#  include "openvino/runtime/intel_gpu/remote_properties.hpp"
+#  include <CL/cl.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // CrossKVCache — slot buffer + swap-to-end compaction for cross-attention K/V
@@ -106,6 +117,51 @@ public:
         std::cout << "[CrossKVCache] Pre-allocated gather workspace: "
                   << workspace_mb << " MB (" << n_layers << " × 2 buffers × max_slots="
                   << max_slots << ")\n";
+
+        // Attempt to allocate the gather workspace in GPU VRAM.
+        // On GPU, OV blits every host tensor on every infer() call, even when set_tensor
+        // is skipped.  Keeping workspace tensors device-resident eliminates that blit
+        // for stable-batch GENERATE steps (the dominant phase).
+        // On failure (CPU device / no context) m_is_gpu stays false and the existing
+        // CPU workspace path is used unchanged.
+        try {
+            m_remote_ctx = m_proj_request.get_compiled_model().get_context();
+            if (!m_remote_ctx) throw std::runtime_error("null context");
+            m_device_K.resize(n_layers);
+            m_device_V.resize(n_layers);
+            m_alias_device_kv.resize(n_layers);
+            // Pre-allocate at N=1; reallocated (cheap clCreateBuffer) on first N>1 gather.
+            const ov::Shape shape1{1, n_heads, T_enc, head_dim};
+            for (size_t l = 0; l < n_layers; ++l) {
+                m_device_K[l] = m_remote_ctx.create_tensor(elem_type, shape1);
+                m_device_V[l] = m_remote_ctx.create_tensor(elem_type, shape1);
+                m_alias_device_kv[l][0] = m_device_K[l];
+                m_alias_device_kv[l][1] = m_device_V[l];
+            }
+            m_last_device_N = 1;
+            m_is_gpu = true;
+            std::cout << "[CrossKVCache] GPU workspace: "
+                      << n_layers << " × 2 VRAM tensors allocated"
+                      << " (blitter-free stable-batch decode)\n";
+        } catch (const std::exception& ex) {
+            std::cout << "[CrossKVCache] CPU workspace mode"
+                      << " (no GPU context: " << ex.what() << ")\n";
+        }
+
+        // GPU-side gather: runs the slot-gather entirely on GPU memory (GDDR6 BW)
+        // eliminating the large H2D blit that causes alternating compute/blitter on
+        // batch-composition changes.  Falls back gracefully if OCL is unavailable.
+#ifdef ENABLE_CROSS_KV_OCL
+        if (m_is_gpu) {
+            _init_cl_gather();
+        }
+#endif
+    }
+
+    ~CrossKVCache() {
+#ifdef ENABLE_CROSS_KV_OCL
+        _cleanup_cl_gather();
+#endif
     }
 
     // -------------------------------------------------------------------
@@ -326,6 +382,28 @@ public:
                 m_last_set_tensor_N = 1;
                 m_last1_req_id = req_ids[0];
             }
+
+            // GPU path: upload the CPU staging tensor to a VRAM N=1 tensor once per
+            // request change; thereafter OV reads from VRAM without any DMA blit.
+            if (m_is_gpu) {
+                if (out_need_set_tensor) {
+                    // Reallocate device tensor if we're transitioning from N>1.
+                    if (m_last_device_N != 1) {
+                        for (size_t l = 0; l < m_n_layers; ++l) {
+                            m_device_K[l] = m_remote_ctx.create_tensor(m_elem_type, shape1);
+                            m_device_V[l] = m_remote_ctx.create_tensor(m_elem_type, shape1);
+                            m_alias_device_kv[l][0] = m_device_K[l];
+                            m_alias_device_kv[l][1] = m_device_V[l];
+                        }
+                        m_last_device_N = 1;
+                    }
+                    for (size_t l = 0; l < m_n_layers; ++l) {
+                        m_alias1_kv[l][0].copy_to(m_device_K[l]);
+                        m_alias1_kv[l][1].copy_to(m_device_V[l]);
+                    }
+                }
+                return m_alias_device_kv;
+            }
             return m_alias1_kv;
         }
 
@@ -339,7 +417,8 @@ public:
         // ---------------------------------------------------------------
         if (req_ids == m_last_req_ids && m_last_set_tensor_N == N) {
             out_need_set_tensor = false;
-            return m_alias_kv;
+            // GPU: return VRAM tensors — OV reads from device, zero DMA blit.
+            return m_is_gpu ? m_alias_device_kv : m_alias_kv;
         }
 
         // ---------------------------------------------------------------
@@ -354,10 +433,30 @@ public:
 
         m_last_req_ids = req_ids;
 
-        // set_tensor needed only on shape change (N differs from last set_tensor call)
+        // GPU plugins upload host tensors to device memory inside set_tensor().
+        // Skipping set_tensor() when only the *content* changed (same N, different
+        // req_ids) leaves stale device-side cross-KV → wrong attention → repetitive
+        // output ("in in in...").  Always call set_tensor() when data was actually
+        // re-gathered (req_ids changed).  On CPU the extra call is a cheap pointer
+        // store; on GPU it triggers the required device upload.
         const bool shape_changed = (N != m_last_set_tensor_N);
         if (shape_changed) m_last_set_tensor_N = N;
-        out_need_set_tensor = shape_changed;
+        out_need_set_tensor = true;  // always: data changed whenever we got past the early-exit above
+
+        // ---------------------------------------------------------------
+        // GPU gather via OpenCL kernel (preferred path on GPU):
+        //   Uploads only the slot-index array (N × 4 B ≈ 64 B for N=16),
+        //   then runs a kernel that gathers directly within VRAM at GPU
+        //   memory bandwidth (~512 GB/s) instead of PCIe (~25 GB/s).
+        //   The slot data was uploaded to the VRAM slot buffer once at
+        //   admit() time, so the hot decode loop is PCIe-free.
+        // ---------------------------------------------------------------
+#ifdef ENABLE_CROSS_KV_OCL
+        if (m_cl_gather) {
+            _run_cl_gather_Ngt1(cur_slots, N, shape_changed);
+            return m_alias_device_kv;
+        }
+#endif
 
         // ---------------------------------------------------------------
         // Gather into pre-allocated workspace.
@@ -403,6 +502,29 @@ public:
                 m_alias_kv[l][1] = ov::Tensor(m_elem_type, shapeN,
                                               m_batch_raw_V[l].data());
             }
+        }
+
+        // GPU path: upload gathered CPU workspace to VRAM once per batch change.
+        // Subsequent infer() calls on the stable batch read from device — no DMA.
+        if (m_is_gpu) {
+            const ov::Shape shapeN{N, m_n_heads, m_T_enc, m_head_dim};
+            if (m_last_device_N != N) {
+                for (size_t l = 0; l < m_n_layers; ++l) {
+                    m_device_K[l] = m_remote_ctx.create_tensor(m_elem_type, shapeN);
+                    m_device_V[l] = m_remote_ctx.create_tensor(m_elem_type, shapeN);
+                    m_alias_device_kv[l][0] = m_device_K[l];
+                    m_alias_device_kv[l][1] = m_device_V[l];
+                }
+                m_last_device_N = N;
+            }
+            for (size_t l = 0; l < m_n_layers; ++l) {
+                // Temporary CPU aliases with exact {N, ...} shape for the copy.
+                ov::Tensor stg_K(m_elem_type, shapeN, m_batch_raw_K[l].data());
+                ov::Tensor stg_V(m_elem_type, shapeN, m_batch_raw_V[l].data());
+                stg_K.copy_to(m_device_K[l]);
+                stg_V.copy_to(m_device_V[l]);
+            }
+            return m_alias_device_kv;
         }
         return m_alias_kv;
     }
@@ -471,12 +593,54 @@ private:
 
     // N>1 batch identity cache: early-exit if req_ids == m_last_req_ids.
     std::vector<uint64_t> m_last_req_ids;
-    // Last N for which set_tensor was actually called; set_tensor skipped when N is stable.
+    // Last N for which set_tensor was actually called; alias tensors are rebuilt on shape change.
     size_t m_last_set_tensor_N = 0;
     // Last request ID for which set_tensor was called in the N=1 path.
     // Used to detect request changes at N=1 (e.g. prompt_needs_solo: A-solo then B-solo
     // in the same step), where N stays 1 but the request — and therefore its K/V slot — changes.
     uint64_t m_last1_req_id = static_cast<uint64_t>(-1);
+
+    // --- GPU device-resident workspace -----------------------------------
+    // When the model runs on a GPU device, OV blits every CPU-backed tensor
+    // into VRAM on every infer() call, even when set_tensor() is skipped.
+    // Keeping the gather workspace in VRAM eliminates that per-step blit for
+    // stable-batch GENERATE steps (the hot path).
+    //
+    // m_is_gpu: true when GPU context was found at construction time.
+    // m_remote_ctx: the RemoteContext used to allocate device tensors.
+    // m_device_K/V[l]: VRAM tensors, shape {N, n_heads, T_enc, head_dim};
+    //   reallocated (cheap clCreateBuffer) only when N changes.
+    // m_alias_device_kv[l]: {m_device_K[l], m_device_V[l]} — returned by
+    //   gather_batch when m_is_gpu; these are device tensors, no CPU blit.
+    // m_last_device_N: current N for which m_device_K/V are allocated.
+    bool m_is_gpu = false;
+    ov::RemoteContext m_remote_ctx;
+    size_t m_last_device_N = 0;
+    std::vector<ov::Tensor> m_device_K;
+    std::vector<ov::Tensor> m_device_V;
+    std::vector<std::array<ov::Tensor, 2>> m_alias_device_kv;
+
+    // ---- GPU-gather members (ENABLE_CROSS_KV_OCL only) -----------------
+    // When m_cl_gather is true:
+    //   m_cl_slot_buf  — VRAM mirror of m_buffer (populated on every admit)
+    //   m_cl_layer_K/V — per-layer output scratch [max_slots × elems]; wrapped
+    //                    as OV RemoteTensors in m_device_K/V with shape {N,...}
+    //   m_cl_indices   — device buffer holding current batch's slot indices [N]
+    //   m_gather_kernels[l*2+kv] — per-(layer,kv) OCL kernel; fixed args set at
+    //                    init; {output cl_mem, N} updated only on shape change
+    // -------------------------------------------------------------------
+#ifdef ENABLE_CROSS_KV_OCL
+    bool             m_cl_gather  = false;
+    cl_context       m_cl_ctx_raw = nullptr;   // AddRef'd by us; released in dtor
+    cl_device_id     m_cl_device  = nullptr;
+    cl_command_queue m_cl_queue   = nullptr;
+    cl_program       m_cl_prog    = nullptr;
+    cl_mem           m_cl_slot_buf = nullptr;  // VRAM slot buffer (same layout as m_buffer)
+    std::vector<cl_mem> m_cl_layer_K;          // [n_layers] each max_slots × elems
+    std::vector<cl_mem> m_cl_layer_V;
+    cl_mem           m_cl_indices  = nullptr;  // [max_slots] int32 — indices for current batch
+    std::vector<cl_kernel> m_gather_kernels;   // [n_layers * 2] one per (layer, kv)
+#endif  // ENABLE_CROSS_KV_OCL
 
     // -------------------------------------------------------------------
     // Helpers
@@ -549,12 +713,242 @@ private:
         }
     }
 
+    // TensorVec must be declared before #ifdef ENABLE_CROSS_KV_OCL so the OCL
+    // helper methods can reference it in their parameter types.
+    using TensorVec = std::vector<ov::Tensor>;
+
+#ifdef ENABLE_CROSS_KV_OCL
+    // -------------------------------------------------------------------
+    // OpenCL gather kernel source.
+    // Instantiated once per (layer, kv) pair.  All fixed args set at init
+    // time; only {output cl_mem, N} are updated when the batch size changes.
+    //
+    // Global work size per kernel = N × elems_per_slot
+    //   gid / elems_per_slot → batch index i
+    //   gid % elems_per_slot → element within slot
+    //   indices[i]           → physical slot in slot_buf
+    // -------------------------------------------------------------------
+    static constexpr const char* kGatherKernelSrc =
+        "__kernel void gather_kv_layer(\n"
+        "    __global const ETYPE* slot_buf,\n"   // [n_layers, 2, max_slots, elems]
+        "    __global const int*   indices,\n"     // [N]
+        "    __global       ETYPE* out,\n"          // [N, elems] for one (layer, kv)
+        "    int  max_slots,\n"
+        "    int  elems_per_slot,\n"
+        "    int  N,\n"
+        "    long src_base\n"                      // element offset to start of this layer+kv
+        ") {\n"
+        "    size_t gid = get_global_id(0);\n"
+        "    if (gid >= (size_t)N * elems_per_slot) return;\n"
+        "    int i   = (int)(gid / elems_per_slot);\n"
+        "    int off = (int)(gid % elems_per_slot);\n"
+        "    int slot = indices[i];\n"
+        "    out[gid] = slot_buf[src_base + (long)slot * elems_per_slot + off];\n"
+        "}\n";
+
+    // Compile kernel, allocate VRAM slot buffer and per-layer output buffers.
+    // Called once from the constructor when m_is_gpu == true.
+    void _init_cl_gather() {
+        OPENVINO_ASSERT(m_storage_type == m_elem_type,
+            "[CrossKVCache] GPU gather requires storage_type == elem_type "
+            "(set CROSS_KV_PRECISION to match the model's compute precision).");
+        try {
+            // Extract cl_context via OV RemoteContext property API.
+            // Avoids including ocl.hpp (which requires C++ OpenCL wrapper headers).
+            cl_context raw_ctx = static_cast<cl_context>(
+                m_remote_ctx.get_params()
+                    .at(ov::intel_gpu::ocl_context.name())
+                    .template as<ov::intel_gpu::gpu_handle_param>());
+            clRetainContext(raw_ctx);
+            m_cl_ctx_raw = raw_ctx;
+
+            // Enumerate devices in this context.
+            cl_uint n_devs = 0;
+            cl_int err = clGetContextInfo(raw_ctx, CL_CONTEXT_NUM_DEVICES, sizeof(n_devs), &n_devs, nullptr);
+            OPENVINO_ASSERT(err == CL_SUCCESS && n_devs > 0, "[CrossKVCache] clGetContextInfo DEVICES failed");
+            clGetContextInfo(raw_ctx, CL_CONTEXT_DEVICES, sizeof(m_cl_device), &m_cl_device, nullptr);
+
+            // Create in-order command queue.
+            cl_int qerr;
+            m_cl_queue = clCreateCommandQueue(raw_ctx, m_cl_device, 0, &qerr);
+            OPENVINO_ASSERT(qerr == CL_SUCCESS, "[CrossKVCache] clCreateCommandQueue failed: " + std::to_string(qerr));
+
+            // Build kernel with element-type define.
+            const char* etype_str = (m_elem_type == ov::element::bf16) ? "ushort"
+                                  : (m_elem_type == ov::element::f16)  ? "half"
+                                  :                                       "float";
+            const std::string opts = std::string("-D ETYPE=") + etype_str;
+            const char* src = kGatherKernelSrc;
+            const size_t src_len = std::strlen(src);
+            m_cl_prog = clCreateProgramWithSource(raw_ctx, 1, &src, &src_len, &err);
+            OPENVINO_ASSERT(err == CL_SUCCESS, "[CrossKVCache] clCreateProgramWithSource failed");
+
+            err = clBuildProgram(m_cl_prog, 1, &m_cl_device, opts.c_str(), nullptr, nullptr);
+            if (err != CL_SUCCESS) {
+                char log[4096] = {};
+                clGetProgramBuildInfo(m_cl_prog, m_cl_device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
+                throw std::runtime_error(std::string("[CrossKVCache] clBuildProgram: ") + log);
+            }
+
+            // VRAM slot buffer: mirrors m_buffer in storage/compute type.
+            // Layout: [n_layers, 2, max_slots, n_heads, T_enc, head_dim]
+            const size_t slot_buf_bytes = m_n_layers * 2 * m_max_slots * _slot_elem_count() * m_elem_type.size();
+            m_cl_slot_buf = clCreateBuffer(raw_ctx, CL_MEM_READ_WRITE, slot_buf_bytes, nullptr, &err);
+            OPENVINO_ASSERT(err == CL_SUCCESS, "[CrossKVCache] clCreateBuffer slot_buf failed");
+
+            // Per-layer output buffers (K and V), each [max_slots × elems].
+            // Wrapped as OV tensors with shape {N, heads, T, hd} per gather call.
+            const size_t layer_out_bytes = m_max_slots * _slot_elem_count() * m_elem_type.size();
+            m_cl_layer_K.resize(m_n_layers, nullptr);
+            m_cl_layer_V.resize(m_n_layers, nullptr);
+            for (size_t l = 0; l < m_n_layers; ++l) {
+                m_cl_layer_K[l] = clCreateBuffer(raw_ctx, CL_MEM_READ_WRITE, layer_out_bytes, nullptr, &err);
+                OPENVINO_ASSERT(err == CL_SUCCESS, "[CrossKVCache] clCreateBuffer layer_K failed");
+                m_cl_layer_V[l] = clCreateBuffer(raw_ctx, CL_MEM_READ_WRITE, layer_out_bytes, nullptr, &err);
+                OPENVINO_ASSERT(err == CL_SUCCESS, "[CrossKVCache] clCreateBuffer layer_V failed");
+            }
+
+            // Indices buffer: [max_slots] int32.
+            m_cl_indices = clCreateBuffer(raw_ctx, CL_MEM_READ_WRITE,
+                                          m_max_slots * sizeof(cl_int), nullptr, &err);
+            OPENVINO_ASSERT(err == CL_SUCCESS, "[CrossKVCache] clCreateBuffer indices failed");
+
+            // Create one kernel per (layer, kv) and set all fixed args once.
+            m_gather_kernels.resize(m_n_layers * 2, nullptr);
+            const int max_sl  = static_cast<int>(m_max_slots);
+            const int els     = static_cast<int>(_slot_elem_count());
+            for (size_t l = 0; l < m_n_layers; ++l) {
+                for (size_t kv = 0; kv < 2; ++kv) {
+                    cl_kernel k = clCreateKernel(m_cl_prog, "gather_kv_layer", &err);
+                    OPENVINO_ASSERT(err == CL_SUCCESS, "[CrossKVCache] clCreateKernel failed");
+
+                    // Fixed args: slot_buf(0), indices(1), max_slots(3), elems(4), src_base(6).
+                    // Variable args: out(2) and N(5) — set per gather call.
+                    cl_mem out_buf = (kv == 0) ? m_cl_layer_K[l] : m_cl_layer_V[l];
+                    const cl_long src_base = (static_cast<cl_long>(l) * 2 * m_max_slots
+                                             + static_cast<cl_long>(kv) * m_max_slots)
+                                            * els;
+                    clSetKernelArg(k, 0, sizeof(cl_mem),  &m_cl_slot_buf);
+                    clSetKernelArg(k, 1, sizeof(cl_mem),  &m_cl_indices);
+                    clSetKernelArg(k, 2, sizeof(cl_mem),  &out_buf);   // initial; updated on N-change
+                    clSetKernelArg(k, 3, sizeof(cl_int),  &max_sl);
+                    clSetKernelArg(k, 4, sizeof(cl_int),  &els);
+                    // arg 5 (N) intentionally left unset until first gather call
+                    clSetKernelArg(k, 6, sizeof(cl_long), &src_base);
+                    m_gather_kernels[l * 2 + kv] = k;
+                }
+            }
+
+            m_cl_gather = true;
+            std::cout << "[CrossKVCache] GPU gather kernel compiled (ETYPE=" << etype_str
+                      << " slot_buf=" << slot_buf_bytes / (1024*1024) << " MB, "
+                      << m_n_layers * 2 << " per-layer kernels)\n";
+
+        } catch (const std::exception& ex) {
+            std::cout << "[CrossKVCache] GPU gather kernel init failed: " << ex.what()
+                      << " — batch recomposition will use H2D copy\n";
+            _cleanup_cl_gather();
+        }
+    }
+
+    void _cleanup_cl_gather() {
+        for (auto k : m_gather_kernels) if (k) clReleaseKernel(k);
+        m_gather_kernels.clear();
+        for (auto b : m_cl_layer_K) if (b) clReleaseMemObject(b);
+        m_cl_layer_K.clear();
+        for (auto b : m_cl_layer_V) if (b) clReleaseMemObject(b);
+        m_cl_layer_V.clear();
+        if (m_cl_indices)  { clReleaseMemObject(m_cl_indices);  m_cl_indices  = nullptr; }
+        if (m_cl_slot_buf) { clReleaseMemObject(m_cl_slot_buf); m_cl_slot_buf = nullptr; }
+        if (m_cl_prog)     { clReleaseProgram(m_cl_prog);       m_cl_prog     = nullptr; }
+        if (m_cl_queue)    { clReleaseCommandQueue(m_cl_queue);  m_cl_queue    = nullptr; }
+        if (m_cl_ctx_raw)  { clReleaseContext(m_cl_ctx_raw);    m_cl_ctx_raw  = nullptr; }
+        m_cl_gather = false;
+    }
+
+    // Upload a newly admitted slot's K/V data to the VRAM slot buffer.
+    // proj_K[l] / proj_V[l] are CPU tensors in m_storage_type (== m_elem_type for GPU).
+    // This is called from _store_from_tensors() on the admit thread — one-time per request.
+    void _upload_slot_to_vram(uint32_t slot, const TensorVec& proj_K, const TensorVec& proj_V) {
+        const size_t els      = _slot_elem_count();
+        const size_t elem_sz  = m_elem_type.size();
+        const size_t slot_bytes = els * elem_sz;
+        for (size_t l = 0; l < m_n_layers; ++l) {
+            // K: byte offset = (l * 2 * max_slots + slot) * slot_bytes
+            const size_t K_off = (l * 2 * m_max_slots + slot) * slot_bytes;
+            clEnqueueWriteBuffer(m_cl_queue, m_cl_slot_buf, CL_FALSE,
+                                 K_off, slot_bytes, proj_K[l].data(), 0, nullptr, nullptr);
+            // V: byte offset = (l * 2 * max_slots + max_slots + slot) * slot_bytes
+            const size_t V_off = (l * 2 * m_max_slots + m_max_slots + slot) * slot_bytes;
+            clEnqueueWriteBuffer(m_cl_queue, m_cl_slot_buf, CL_FALSE,
+                                 V_off, slot_bytes, proj_V[l].data(), 0, nullptr, nullptr);
+        }
+        // Blocking finish: slot data must be in VRAM before admit() returns and the
+        // request becomes schedulable for the first GENERATE step.
+        clFinish(m_cl_queue);
+    }
+
+    // Run gather kernel for N>1.  Uploads indices (tiny H2D), updates per-kernel
+    // output/N args on shape change, then enqueues all (layer × kv) kernels.
+    // Precondition: cur_slots.size() == N, all slots valid.
+    void _run_cl_gather_Ngt1(const std::vector<uint32_t>& cur_slots,
+                              size_t N, bool shape_changed) {
+        // --- 1. Upload slot indices (N × 4 B ≈ 64 B for N=16) ---
+        std::vector<cl_int> idx(N);
+        for (size_t i = 0; i < N; ++i) idx[i] = static_cast<cl_int>(cur_slots[i]);
+        // Non-blocking; the in-order queue ensures this completes before the kernels run.
+        clEnqueueWriteBuffer(m_cl_queue, m_cl_indices, CL_FALSE, 0,
+                             N * sizeof(cl_int), idx.data(), 0, nullptr, nullptr);
+
+        // --- 2. On N-change: update per-kernel {output cl_mem, N} and rewrap OV tensors ---
+        if (shape_changed) {
+            const ov::Shape shapeN{N, m_n_heads, m_T_enc, m_head_dim};
+            const cl_int n_cl = static_cast<cl_int>(N);
+            // Wrap the pre-allocated per-layer VRAM buffers as OV RemoteTensors
+            // using the property-map API so we don't need ocl.hpp C++ wrappers.
+            const ov::AnyMap buf_params_base = {
+                {ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::OCL_BUFFER}
+            };
+            for (size_t l = 0; l < m_n_layers; ++l) {
+                cl_kernel kK = m_gather_kernels[l * 2 + 0];
+                cl_kernel kV = m_gather_kernels[l * 2 + 1];
+                clSetKernelArg(kK, 2, sizeof(cl_mem), &m_cl_layer_K[l]);
+                clSetKernelArg(kK, 5, sizeof(cl_int), &n_cl);
+                clSetKernelArg(kV, 2, sizeof(cl_mem), &m_cl_layer_V[l]);
+                clSetKernelArg(kV, 5, sizeof(cl_int), &n_cl);
+                ov::AnyMap kp = buf_params_base;
+                kp[ov::intel_gpu::mem_handle.name()] =
+                    static_cast<ov::intel_gpu::gpu_handle_param>(m_cl_layer_K[l]);
+                m_device_K[l] = m_remote_ctx.create_tensor(m_elem_type, shapeN, kp);
+                kp[ov::intel_gpu::mem_handle.name()] =
+                    static_cast<ov::intel_gpu::gpu_handle_param>(m_cl_layer_V[l]);
+                m_device_V[l] = m_remote_ctx.create_tensor(m_elem_type, shapeN, kp);
+                m_alias_device_kv[l][0] = m_device_K[l];
+                m_alias_device_kv[l][1] = m_device_V[l];
+            }
+            m_last_device_N = N;
+        }
+
+        // --- 3. Enqueue per-(layer, kv) gather kernels ---
+        // Global size: N × elems_per_slot.  Rounded up to a multiple of 64 for
+        // better occupancy; the kernel bounds-checks so padding items are no-ops.
+        const size_t base_gs  = N * _slot_elem_count();
+        const size_t local_sz = 64;
+        const size_t gs       = (base_gs + local_sz - 1) / local_sz * local_sz;
+        for (size_t lk = 0; lk < m_n_layers * 2; ++lk)
+            clEnqueueNDRangeKernel(m_cl_queue, m_gather_kernels[lk], 1,
+                                   nullptr, &gs, &local_sz, 0, nullptr, nullptr);
+
+        // Blocking finish: gathered VRAM tensors must be ready before infer() reads them.
+        clFinish(m_cl_queue);
+    }
+#endif  // ENABLE_CROSS_KV_OCL
+
     // -------------------------------------------------------------------
     // Run projector and return deep-copies of K/V outputs.
     // Serialized via m_proj_mutex so concurrent admits don't corrupt outputs.
     // Does NOT hold m_mutex so the main thread can call release() freely.
     // -------------------------------------------------------------------
-    using TensorVec = std::vector<ov::Tensor>;
     std::pair<TensorVec, TensorVec>
     _run_projector(const ov::Tensor& encoder_hidden_state) {
         std::lock_guard<std::mutex> plk(m_proj_mutex);
@@ -606,6 +1000,15 @@ private:
             std::memcpy(_slot_ptr(l, 0, slot), proj_K[l].data(), slot_bytes);
             std::memcpy(_slot_ptr(l, 1, slot), proj_V[l].data(), slot_bytes);
         }
+
+        // Mirror admitted slot to VRAM slot buffer so the GPU gather kernel
+        // can read from it directly without a per-gather H2D upload.
+        // This is a one-time cost per request admit; the hot decode loop is free.
+#ifdef ENABLE_CROSS_KV_OCL
+        if (m_cl_gather)
+            _upload_slot_to_vram(slot, proj_K, proj_V);
+#endif
+
         std::cout << "[CrossKVCache] Admitted req " << req_id << " → slot " << slot
                   << " (active=" << n_active << "/" << m_max_slots << ")\n";
     }

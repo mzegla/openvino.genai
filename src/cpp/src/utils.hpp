@@ -130,7 +130,7 @@ ov::genai::TokenizedInputs subtract_chat_tokenized_inputs(const ov::genai::Token
 
 void apply_slice_before_matmul_transformation(std::shared_ptr<ov::Model> model);
 
-void apply_gather_before_matmul_transformation(std::shared_ptr<ov::Model> model);
+OPENVINO_GENAI_EXPORTS void apply_gather_before_matmul_transformation(std::shared_ptr<ov::Model> model);
 
 ov::Core& singleton_core();
 

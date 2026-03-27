@@ -257,6 +257,24 @@ if(ENABLE_SYSTEM_OPENCL AND TARGET OpenCL::OpenCL)
     target_link_libraries(${TARGET_NAME} PRIVATE OpenCL::OpenCL)
 endif()
 
+# ── CrossKVCache GPU gather: independent OpenCL check ────────────────────────
+# Defines ENABLE_CROSS_KV_OCL so the GPU-side gather kernel in cross_kv_cache.hpp
+# is compiled in without requiring -DENABLE_SYSTEM_OPENCL=ON (which would affect
+# OV's own GPU plugin build and can break it).
+# Uses only CL/cl.h (raw C OpenCL API) + OV's RemoteContext property headers;
+# no dependency on CL/opencl.hpp or CL/cl2.hpp C++ wrappers.
+if(NOT TARGET OpenCL::OpenCL)
+    find_package(OpenCL QUIET)
+endif()
+if(TARGET OpenCL::OpenCL)
+    target_compile_definitions(${TARGET_NAME_OBJ} PRIVATE ENABLE_CROSS_KV_OCL)
+    target_link_libraries(${TARGET_NAME_OBJ} PRIVATE OpenCL::OpenCL)
+    target_link_libraries(${TARGET_NAME} PRIVATE OpenCL::OpenCL)
+    message(STATUS "[CrossKVCache] GPU gather kernel enabled (OpenCL found)")
+else()
+    message(STATUS "[CrossKVCache] OpenCL not found — gather uses CPU H2D copy")
+endif()
+
 if(ENABLE_XGRAMMAR)
     target_link_libraries(${TARGET_NAME} PRIVATE xgrammar)
 endif()
