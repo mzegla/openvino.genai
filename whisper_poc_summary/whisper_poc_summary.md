@@ -2,8 +2,7 @@
 
 > This document covers motivation, design decisions, implementation design, preliminary observations and recommendations.
 > The idea should be applicable for all Whisper variants, but I worked with whisper-v3-large during this POC
-> so this document focuses on that specific variant. This document has been created with help of AI.
-> Apologies if I missed catching any incorrect parts in the process.
+> so this document focuses on that specific variant.
 
 ---
 
@@ -498,11 +497,6 @@ Key design decisions:
   retains the K/V projection chains and re-runs them from `encoder_hidden_states` on every
   `forward()` call, as in the original stateless-but-uncached path. This is the correctness
   baseline used in scenario 12 (§4.2).
-
-- **Optional bf16 storage.** The `CROSS_KV_PRECISION` environment variable (default: same as
-  compute type) controls whether slots are stored in bf16. This halves DRAM/L3 footprint at the
-  cost of a conversion on gather. For Whisper-large-v3: 32 layers × 2 × 1500 × 20 heads × 64 =
-  ~469 MB per slot in f32; ~234 MB in bf16.
 
 - **Fast paths in `gather_batch()`.** Two cases avoid copying:
   - *N=1*: `gather_batch()` wraps the slot-buffer pointer directly as an `ov::Tensor` with no
