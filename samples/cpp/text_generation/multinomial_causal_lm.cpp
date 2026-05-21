@@ -6,29 +6,28 @@
 
 int main(int argc, char* argv[]) try {
     if (argc != 3) {
-        throw std::runtime_error(std::string{"Usage: "} + argv[0] + " <MODEL_DIR> '<PROMPT>'");
+        throw std::runtime_error(std::string{"Usage: "} + argv[0] + " <MODEL_DIR> <PROMPT>");
     }
 
     std::string models_path = argv[1];
-    std::string prompt = argv[2];
+    std::string prompt      = argv[2];
+    std::string device      = "CPU";
 
-    std::string device = "CPU";  // GPU can be used as well
     ov::genai::LLMPipeline pipe(models_path, device);
 
     ov::genai::GenerationConfig config;
     config.max_new_tokens = 100;
-    config.do_sample = true;
-    config.top_p = 0.9;
-    config.top_k = 30;
+    config.do_sample      = true;
+    config.top_p          = 0.9f;
+    config.top_k          = 50;
 
     auto streamer = [](std::string subword) {
         std::cout << subword << std::flush;
         return ov::genai::StreamingStatus::RUNNING;
     };
 
-    // Since the streamer is set, the results will
-    // be printed each time a new token is generated.
     pipe.generate(prompt, config, streamer);
+    std::cout << '\n';
 } catch (const std::exception& error) {
     try {
         std::cerr << error.what() << '\n';

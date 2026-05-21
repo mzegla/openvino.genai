@@ -50,6 +50,9 @@ class Sequence {
 
     TokenIds m_generated_ids;
     LogProbs m_generated_log_probs;
+    // Raw pre-sampling logits for the last generated token.
+    // Overwritten each step; only valid for streaming (single-token) reads.
+    std::vector<float> m_last_raw_logits;
     uint64_t m_grouped_id;
     uint64_t m_id = _get_next_global_sequence_id();
     ov::Tensor m_hidden_state = ov::Tensor();
@@ -79,6 +82,7 @@ class Sequence {
     Sequence(const Sequence& seq, const uint64_t id) :
         m_generated_ids(seq.m_generated_ids),
         m_generated_log_probs(seq.m_generated_log_probs),
+        m_last_raw_logits(seq.m_last_raw_logits),
         m_grouped_id(id),
         m_hidden_state(seq.m_hidden_state),
         m_status(seq.m_status),
@@ -205,9 +209,17 @@ public:
                 output.generated_ids = std::move(token_id);
                 output.generated_log_probs = std::move(log_probs);
                 output.finish_reason = get_finish_reason();
+                // Include raw logits when return_logits is set (only meaningful for single-token streaming).
+                if (token_cnt == 1 && !m_last_raw_logits.empty())
+                    output.generated_logits = m_last_raw_logits;
             }
         }
         return output;
+    }
+
+    /// Store the raw pre-sampling logit vector for the current token.
+    void set_last_raw_logits(const float* data, size_t size) {
+        m_last_raw_logits.assign(data, data + size);
     }
 
     size_t get_generated_len() const {
