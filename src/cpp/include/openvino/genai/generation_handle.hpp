@@ -80,6 +80,10 @@ struct GenerationResult {
 struct GenerationOutput {
     std::vector<int64_t> generated_ids;
     std::vector<float> generated_log_probs;
+    /// Raw pre-sampling model logits for the last token in generated_ids.
+    /// Populated only when GenerationConfig::return_logits is true.
+    /// Size equals the model vocabulary size.
+    std::vector<float> generated_logits;
     float score = 0;
     GenerationFinishReason finish_reason = GenerationFinishReason::NONE;
 };

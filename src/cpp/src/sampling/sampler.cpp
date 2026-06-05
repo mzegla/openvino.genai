@@ -1520,6 +1520,10 @@ SequenceGroupSamplingInfo Sampler::sample_from_sequence_group(SequenceGroup::Ptr
                 }
 
                 auto logit_vector = _get_logit_vector(sequence_group_logits, running_sequence_id, logit_token_offset);
+                // Capture raw-logit distribution metrics before any transforms.
+                if (logit_token_offset == 0 && sampling_params.return_logits) {
+                    running_sequence->set_last_raw_logits(logit_vector.m_data, logit_vector.m_size);
+                }
                 logit_processor.apply(logit_vector);
                 
                 Token sampled_token;

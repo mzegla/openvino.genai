@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <atomic>
+#include <iostream>
 #include <thread>
 #include <optional>
 #include "openvino/genai/cache_eviction.hpp"
