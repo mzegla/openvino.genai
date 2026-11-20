@@ -4,3 +4,4 @@
 
 add_subdirectory(accuracy)
 add_subdirectory(benchmark)
+add_subdirectory(staged_poc)

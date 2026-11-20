@@ -147,6 +147,7 @@ protected:
     class DFlashDecodingImpl;
     class MtpDecodingImpl;
     class PromptLookupImpl;
+    class StagedImpl;
 
     friend class ContinuousBatchingForSpeculativeDecodingImpl;
 

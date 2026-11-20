@@ -10,6 +10,7 @@
 #include "openvino/genai/generation_handle.hpp"
 #include "openvino/genai/tokenizer.hpp"
 #include "continuous_batching/pipeline_impl.hpp"
+#include "continuous_batching/staged_pipeline_impl.hpp"
 #include "continuous_batching/generate_properties.hpp"
 #include "prompt_lookup/prompt_lookup_impl.hpp"
 #include "continuous_batching/timer.hpp"
@@ -45,6 +46,16 @@ extract_prompt_lookup_from_config(ov::AnyMap& config) {
     return res;
 }
 
+std::optional<std::string> extract_staged_engine_from_config(ov::AnyMap& config) {
+    const auto it = config.find(ov::genai::STAGED_ENGINE_PROPERTY);
+    if (it == config.end()) {
+        return std::nullopt;
+    }
+    std::string launch_policy = it->second.as<std::string>();
+    config.erase(it);
+    return launch_policy;
+}
+
 float get_load_time(std::chrono::steady_clock::time_point start_time) {
     auto stop_time = std::chrono::steady_clock::now();
     return std::chrono::duration_cast<std::chrono::milliseconds>(stop_time - start_time).count();
@@ -78,6 +89,7 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline( const std::filesystem::p
     auto properties_without_draft_model = properties;
     auto draft_model_descr = ov::genai::extract_draft_model_from_config(properties_without_draft_model);
     auto is_prompt_lookup_enabled = extract_prompt_lookup_from_config(properties_without_draft_model);
+    auto staged_engine = extract_staged_engine_from_config(properties_without_draft_model);
     auto dflash_rt_info = utils::dflash::extract_dflash_info_from_config(draft_model_descr.properties);
     auto eagle_rt_info = utils::eagle3::extract_eagle3_info_from_config(draft_model_descr.properties, models_path);
     auto mtp_rt_info = utils::mtp::extract_mtp_info_from_config(draft_model_descr.properties);
@@ -134,6 +146,9 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline( const std::filesystem::p
         OPENVINO_ASSERT(embedder == nullptr, "Speculative decoding is not supported for models with embeddings");
         auto main_model_descr = ov::genai::ModelDesc(model, tokenizer, device, properties_without_draft_model_without_gguf, scheduler_config, generation_config);
         m_impl = std::make_shared<SpeculativeDecodingImpl>(main_model_descr, draft_model_descr);
+    } else if (staged_engine) {
+        OPENVINO_ASSERT(embedder == nullptr, "Staged engine supports text models only");
+        m_impl = std::make_shared<StagedImpl>(model, tokenizer, scheduler_config, device, properties_without_draft_model_without_gguf, generation_config, StagedImpl::parse_launch_policy(*staged_engine));
     } else if (embedder) {
         m_impl = std::make_shared<ContinuousBatchingImpl>(model, embedder, tokenizer, scheduler_config, device, properties_without_draft_model_without_gguf, generation_config);
     }
