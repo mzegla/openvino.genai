@@ -1,22 +1,29 @@
 // Copyright (C) 2023-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-// POC tool: runs the same closed loop greedy workload on the regular continuous batching engine and on the
-// staged engine, then compares generated token ids and timings.
+// POC tool: runs the same workload on the regular continuous batching engine and on the staged engine,
+// then compares generated token ids and timings.
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cxxopts.hpp>
 
 #include "openvino/genai/continuous_batching_pipeline.hpp"
 #include "openvino/genai/generation_handle.hpp"
+#include "openvino/genai/tokenizer.hpp"
 
 namespace {
 
@@ -33,9 +40,18 @@ const std::vector<std::string> BASE_PROMPTS = {
     "List some practical tips for learning a new programming language quickly.",
 };
 
+struct Request {
+    std::string prompt;
+    ov::genai::GenerationConfig config;
+    // offset from the start of the run
+    double arrival_s = 0.0;
+};
+
 struct RunResult {
     std::vector<std::vector<int64_t>> tokens;
     double wall_s = 0.0;
+    // time the engine had no requests and waited for the next arrival
+    double idle_s = 0.0;
     double forward_s = 0.0;
     size_t num_steps = 0;
     std::vector<double> ttft_ms;
@@ -47,6 +63,10 @@ struct RunResult {
             total += request_tokens.size();
         }
         return total;
+    }
+
+    double active_s() const {
+        return wall_s - idle_s;
     }
 };
 
@@ -73,22 +93,132 @@ double percentile(std::vector<double> values, double fraction) {
     return values[static_cast<size_t>(fraction * (values.size() - 1))];
 }
 
+std::vector<Request> make_requests(size_t num_requests,
+                                   const ov::genai::GenerationConfig& base_config,
+                                   size_t prompt_repeat,
+                                   bool varied_lengths,
+                                   double request_rate) {
+    // fixed seed: every engine gets the same prompts, lengths and arrival times
+    std::mt19937 rng(42);
+    std::vector<Request> requests(num_requests);
+    double arrival_s = 0.0;
+    for (size_t request_id = 0; request_id < num_requests; ++request_id) {
+        Request& request = requests[request_id];
+        const size_t repeat =
+            varied_lengths ? std::uniform_int_distribution<size_t>(1, prompt_repeat)(rng) : prompt_repeat;
+        // the prefix makes every prompt unique, so mixed up requests show as a mismatch
+        request.prompt = "Request " + std::to_string(request_id) + ".";
+        for (size_t i = 0; i < repeat; ++i) {
+            request.prompt += " " + BASE_PROMPTS[(request_id + i) % BASE_PROMPTS.size()];
+        }
+
+        request.config = base_config;
+        request.config.rng_seed = request_id;
+        if (varied_lengths) {
+            const size_t max_new_tokens = base_config.max_new_tokens;
+            request.config.max_new_tokens =
+                std::uniform_int_distribution<size_t>(std::max<size_t>(max_new_tokens / 4, 1), max_new_tokens)(rng);
+        }
+
+        if (request_rate > 0.0 && request_id > 0) {
+            arrival_s += std::exponential_distribution<double>(request_rate)(rng);
+        }
+        request.arrival_s = arrival_s;
+    }
+    return requests;
+}
+
+// With use_arrival_times a second thread submits each request at its arrival time while this thread steps the
+// pipeline, otherwise every request is submitted before the first step.
 RunResult run_workload(ov::genai::ContinuousBatchingPipeline& pipe,
-                       const std::vector<std::string>& prompts,
-                       const ov::genai::GenerationConfig& config) {
+                       const std::vector<Request>& requests,
+                       bool use_arrival_times) {
+    const size_t num_requests = requests.size();
     RunResult result;
-    result.tokens.resize(prompts.size());
-    std::vector<ov::genai::GenerationHandle> handles;
-    handles.reserve(prompts.size());
+    result.tokens.resize(num_requests);
+    std::vector<ov::genai::GenerationHandle> handles(num_requests);
+    std::vector<Clock::time_point> last_token_time(num_requests);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    // Guarded by mutex. Requests are submitted in id order, entries below num_submitted belong to this thread.
+    size_t num_submitted = 0;
+    bool submitter_finished = false;
+    bool stop_submitter = false;
+    std::exception_ptr submitter_error;
 
     const auto start = Clock::now();
-    for (size_t request_id = 0; request_id < prompts.size(); ++request_id) {
-        handles.push_back(pipe.add_request(request_id, prompts[request_id], config));
+    const auto submit = [&](size_t request_id) {
+        const auto submit_time = Clock::now();
+        auto handle = pipe.add_request(request_id, requests[request_id].prompt, requests[request_id].config);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            handles[request_id] = std::move(handle);
+            last_token_time[request_id] = submit_time;
+            ++num_submitted;
+        }
+        cv.notify_all();
+    };
+
+    std::thread submitter;
+    // stops and joins the submitter on every exit path, including a failing step()
+    struct SubmitterJoiner {
+        std::thread& thread;
+        std::mutex& mutex;
+        std::condition_variable& cv;
+        bool& stop;
+
+        ~SubmitterJoiner() {
+            if (!thread.joinable()) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                stop = true;
+            }
+            cv.notify_all();
+            thread.join();
+        }
+    } submitter_joiner{submitter, mutex, cv, stop_submitter};
+
+    if (use_arrival_times) {
+        submitter = std::thread([&] {
+            try {
+                for (size_t request_id = 0; request_id < num_requests; ++request_id) {
+                    const auto arrival = start + std::chrono::duration_cast<Clock::duration>(
+                                                     std::chrono::duration<double>(requests[request_id].arrival_s));
+                    {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        if (cv.wait_until(lock, arrival, [&] { return stop_submitter; })) {
+                            break;
+                        }
+                    }
+                    submit(request_id);
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex);
+                submitter_error = std::current_exception();
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                submitter_finished = true;
+            }
+            cv.notify_all();
+        });
+    } else {
+        for (size_t request_id = 0; request_id < num_requests; ++request_id) {
+            submit(request_id);
+        }
+        submitter_finished = true;
     }
 
-    std::vector<Clock::time_point> last_token_time(prompts.size(), start);
     const auto drain = [&] {
-        for (size_t request_id = 0; request_id < handles.size(); ++request_id) {
+        size_t num_readable = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            num_readable = num_submitted;
+        }
+        for (size_t request_id = 0; request_id < num_readable; ++request_id) {
             while (handles[request_id]->can_read()) {
                 const auto outputs = handles[request_id]->read();
                 const auto now = Clock::now();
@@ -115,14 +245,43 @@ RunResult run_workload(ov::genai::ContinuousBatchingPipeline& pipe,
         }
     };
 
-    while (pipe.has_non_finished_requests()) {
-        pipe.step();
-        ++result.num_steps;
-        result.forward_s += pipe.get_metrics().inference_duration / 1e6;
-        drain();
+    while (true) {
+        // Taken before asking the pipeline: a request counted here is already visible to it.
+        size_t submitted_snapshot = 0;
+        bool finished_snapshot = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            submitted_snapshot = num_submitted;
+            finished_snapshot = submitter_finished;
+        }
+        if (pipe.has_non_finished_requests()) {
+            pipe.step();
+            ++result.num_steps;
+            result.forward_s += pipe.get_metrics().inference_duration / 1e6;
+            drain();
+            continue;
+        }
+        if (finished_snapshot) {
+            break;
+        }
+        const auto idle_start = Clock::now();
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [&] {
+                return submitter_finished || num_submitted != submitted_snapshot;
+            });
+        }
+        result.idle_s += to_ms(Clock::now() - idle_start) / 1e3;
     }
     drain();
     result.wall_s = to_ms(Clock::now() - start) / 1e3;
+
+    if (submitter.joinable()) {
+        submitter.join();
+    }
+    if (submitter_error) {
+        std::rethrow_exception(submitter_error);
+    }
     return result;
 }
 
@@ -167,13 +326,18 @@ int main(int argc, char* argv[]) try {
     options.add_options()
     ("m,model", "Path to model and tokenizers base directory", cxxopts::value<std::string>())
     ("device", "Target device", cxxopts::value<std::string>()->default_value("CPU"))
-    ("n,num_requests", "Number of requests, all submitted before the first step", cxxopts::value<size_t>()->default_value("8"))
+    ("n,num_requests", "Number of requests", cxxopts::value<size_t>()->default_value("8"))
+    ("request_rate", "Requests per second with Poisson arrivals. 0 submits every request before the first step", cxxopts::value<double>()->default_value("0"))
+    ("prompt_repeat", "Number of base prompts concatenated into each prompt", cxxopts::value<size_t>()->default_value("1"))
+    ("varied_lengths", "Draw each prompt length from [1, prompt_repeat] base prompts and each output length from [max_new_tokens / 4, max_new_tokens]", cxxopts::value<bool>()->default_value("false"))
     ("max_new_tokens", "Number of tokens to generate per request", cxxopts::value<size_t>()->default_value("128"))
     ("ignore_eos", "Generate max_new_tokens for every request", cxxopts::value<bool>()->default_value("true"))
+    ("temperature", "Sampling temperature. 0 keeps greedy decoding unless top_k is set", cxxopts::value<float>()->default_value("0"))
+    ("top_k", "Sampling top_k. 0 keeps greedy decoding unless temperature is set", cxxopts::value<size_t>()->default_value("0"))
     ("engines", "Comma separated engines to run: baseline, serial, split", cxxopts::value<std::string>()->default_value("baseline,serial,split"))
     ("b,max_batch_size", "A maximum number of batched tokens", cxxopts::value<size_t>()->default_value("256"))
     ("cache_size", "Size of memory used for KV cache in GB", cxxopts::value<size_t>()->default_value("2"))
-    ("warmup", "Run the workload once before the measured run", cxxopts::value<bool>()->default_value("true"))
+    ("warmup", "Run the workload once, with every request submitted at the start, before the measured run", cxxopts::value<bool>()->default_value("true"))
     ("h,help", "Print usage");
 
     cxxopts::ParseResult args;
@@ -193,39 +357,86 @@ int main(int argc, char* argv[]) try {
     const size_t num_requests = args["num_requests"].as<size_t>();
     const std::vector<std::string> engines = split(args["engines"].as<std::string>(), ',');
     const bool warmup = args["warmup"].as<bool>();
-
-    std::vector<std::string> prompts;
-    for (size_t request_id = 0; request_id < num_requests; ++request_id) {
-        // the prefix makes every prompt unique, so mixed up requests show as a mismatch
-        prompts.push_back("Request " + std::to_string(request_id) + ". " +
-                          BASE_PROMPTS[request_id % BASE_PROMPTS.size()]);
-    }
+    const double request_rate = args["request_rate"].as<double>();
+    const bool is_dynamic = request_rate > 0.0;
+    const size_t prompt_repeat = std::max<size_t>(args["prompt_repeat"].as<size_t>(), 1);
+    const float temperature = args["temperature"].as<float>();
+    const size_t top_k = args["top_k"].as<size_t>();
 
     ov::genai::GenerationConfig config;
     config.max_new_tokens = args["max_new_tokens"].as<size_t>();
     config.ignore_eos = args["ignore_eos"].as<bool>();
+    if (temperature > 0.0f || top_k > 0) {
+        config.do_sample = true;
+        if (temperature > 0.0f) {
+            config.temperature = temperature;
+        }
+        if (top_k > 0) {
+            config.top_k = top_k;
+        }
+    }
+
+    const std::vector<Request> requests =
+        make_requests(num_requests, config, prompt_repeat, args["varied_lengths"].as<bool>(), request_rate);
 
     ov::genai::SchedulerConfig scheduler_config;
     scheduler_config.max_num_batched_tokens = args["max_batch_size"].as<size_t>();
     scheduler_config.cache_size = args["cache_size"].as<size_t>();
 
+    std::cout << "Workload: " << num_requests << " requests on " << device << ", ";
+    if (is_dynamic) {
+        std::cout << request_rate << " requests/s with the last arrival at " << requests.back().arrival_s << " s";
+    } else {
+        std::cout << "all submitted before the first step";
+    }
+    if (config.do_sample) {
+        std::cout << ", sampling with temperature " << config.temperature << " and top_k ";
+        if (top_k > 0) {
+            std::cout << top_k;
+        } else {
+            std::cout << "off";
+        }
+    } else {
+        std::cout << ", greedy decoding";
+    }
+    std::cout << std::endl;
+
     std::vector<RunResult> results;
+    bool workload_sizes_printed = false;
     for (const std::string& engine : engines) {
         ov::AnyMap properties;
         if (engine != "baseline") {
             properties["staged_engine"] = engine;
         }
-        std::cout << "Running engine '" << engine << "' on " << device << " with " << num_requests << " requests"
-                  << std::endl;
         ov::genai::ContinuousBatchingPipeline pipe(models_path, scheduler_config, device, properties);
-        if (warmup) {
-            run_workload(pipe, prompts, config);
+        if (!workload_sizes_printed) {
+            ov::genai::Tokenizer tokenizer = pipe.get_tokenizer();
+            size_t total_prompt_tokens = 0, min_prompt_tokens = SIZE_MAX, max_prompt_tokens = 0;
+            size_t min_new_tokens = SIZE_MAX, max_new_tokens = 0;
+            for (const Request& request : requests) {
+                const size_t prompt_tokens = tokenizer.encode(request.prompt).input_ids.get_size();
+                total_prompt_tokens += prompt_tokens;
+                min_prompt_tokens = std::min(min_prompt_tokens, prompt_tokens);
+                max_prompt_tokens = std::max(max_prompt_tokens, prompt_tokens);
+                min_new_tokens = std::min(min_new_tokens, request.config.max_new_tokens);
+                max_new_tokens = std::max(max_new_tokens, request.config.max_new_tokens);
+            }
+            std::cout << "Prompt tokens per request: " << min_prompt_tokens << " to " << max_prompt_tokens << " ("
+                      << total_prompt_tokens << " in total), new tokens per request: " << min_new_tokens << " to "
+                      << max_new_tokens << std::endl;
+            workload_sizes_printed = true;
         }
-        results.push_back(run_workload(pipe, prompts, config));
+        std::cout << "Running engine '" << engine << "'" << std::endl;
+        if (warmup) {
+            run_workload(pipe, requests, false);
+        }
+        results.push_back(run_workload(pipe, requests, is_dynamic));
     }
 
     const auto baseline_it = std::find(engines.begin(), engines.end(), "baseline");
-    const RunResult* baseline = baseline_it == engines.end() ? nullptr : &results[baseline_it - engines.begin()];
+    // With arrivals the batches depend on timing, so token ids are not expected to match.
+    const RunResult* baseline =
+        baseline_it == engines.end() || is_dynamic ? nullptr : &results[baseline_it - engines.begin()];
 
     bool serial_matches = true;
     std::vector<std::string> match_column(engines.size(), "-");
@@ -243,22 +454,32 @@ int main(int argc, char* argv[]) try {
     }
 
     std::cout << std::endl
-              << std::left << std::setw(10) << "engine" << std::right << std::setw(10) << "wall s" << std::setw(10)
-              << "tokens" << std::setw(12) << "tokens/s" << std::setw(9) << "steps" << std::setw(12) << "forward %"
-              << std::setw(11) << "TTFT ms" << std::setw(11) << "ITL ms" << std::setw(12) << "ITL p95 ms"
-              << std::setw(13) << "exact match" << std::endl;
+              << std::left << std::setw(10) << "engine" << std::right << std::setw(9) << "wall s" << std::setw(10)
+              << "active s" << std::setw(9) << "tokens" << std::setw(10) << "tokens/s" << std::setw(8) << "steps"
+              << std::setw(11) << "forward %" << std::setw(10) << "TTFT ms" << std::setw(10) << "TTFT p95"
+              << std::setw(9) << "ITL ms" << std::setw(9) << "ITL p95" << std::setw(9) << "ITL p99" << std::setw(13)
+              << "exact match" << std::endl;
     for (size_t i = 0; i < engines.size(); ++i) {
         const RunResult& result = results[i];
         std::cout << std::left << std::setw(10) << engines[i] << std::right << std::fixed << std::setprecision(2)
-                  << std::setw(10) << result.wall_s << std::setw(10) << result.num_tokens() << std::setw(12)
-                  << result.num_tokens() / result.wall_s << std::setw(9) << result.num_steps << std::setw(12)
-                  << 100.0 * result.forward_s / result.wall_s << std::setw(11) << mean(result.ttft_ms)
-                  << std::setw(11) << mean(result.inter_token_ms) << std::setw(12)
-                  << percentile(result.inter_token_ms, 0.95) << std::setw(13) << match_column[i] << std::endl;
+                  << std::setw(9) << result.wall_s << std::setw(10) << result.active_s() << std::setw(9)
+                  << result.num_tokens() << std::setw(10) << result.num_tokens() / result.wall_s << std::setw(8)
+                  << result.num_steps << std::setw(11) << 100.0 * result.forward_s / result.active_s()
+                  << std::setw(10) << mean(result.ttft_ms) << std::setw(10) << percentile(result.ttft_ms, 0.95)
+                  << std::setw(9) << mean(result.inter_token_ms) << std::setw(9)
+                  << percentile(result.inter_token_ms, 0.95) << std::setw(9)
+                  << percentile(result.inter_token_ms, 0.99) << std::setw(13) << match_column[i] << std::endl;
     }
     std::cout << std::endl
-              << "forward %: share of wall time spent in ModelRunner::forward (input packing + inference)." << std::endl
-              << "exact match: requests whose generated token ids are identical to the baseline engine." << std::endl;
+              << "active s: wall time minus the time the engine had no requests and waited for the next arrival."
+              << std::endl
+              << "tokens/s: generated tokens over wall time. Below capacity it follows the arrival rate." << std::endl
+              << "forward %: share of active time spent in ModelRunner::forward (input packing + inference)."
+              << std::endl
+              << "TTFT: from add_request() to the first token read after a step. ITL: time between tokens of a request."
+              << std::endl
+              << "exact match: requests whose generated token ids are identical to the baseline engine. Not compared"
+              << " with --request_rate, where batches depend on timing." << std::endl;
 
     if (!serial_matches) {
         std::cout << "FAILED: the serial staged engine must reproduce the baseline token ids" << std::endl;
