@@ -282,6 +282,10 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(std
                                                        /* is_use_adaptive_rkv = */ false);
     }
 
+    const auto profiling_it = filtered_properties->find(ov::enable_profiling.name());
+    m_model_runner->set_collect_profiling(profiling_it != filtered_properties->end() &&
+                                          profiling_it->second.as<bool>());
+
     if (hidden_state_bytes_per_token > 0) {
         m_hidden_state_cache = std::make_unique<HiddenStateCache>([cache_orchestrator, kv_block_size] {
             return cache_orchestrator->get_block_manager(CacheType::KV_CACHE).get_total_block_count() * kv_block_size;
@@ -697,6 +701,15 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_step() {
     static ManualTimer step_timer("step()");
     step_timer.start();
 
+    m_pipeline_metrics.forward_input_us = 0;
+    m_pipeline_metrics.forward_infer_us = 0;
+    m_pipeline_metrics.forward_output_us = 0;
+    m_pipeline_metrics.forward_profiling_us = 0;
+    m_pipeline_metrics.forward_operator_us = 0;
+    m_pipeline_metrics.forward_profiled_operations = 0;
+    m_pipeline_metrics.forward_calls = 0;
+    m_pipeline_metrics.logits_access_us = 0;
+
     _pull_awaiting_requests();
     _validate_linear_verifier_constraints();
     _reserve_linear_attention_scratch();
@@ -774,6 +787,14 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_step() {
         timer.start();
         logits = m_model_runner->forward(m_requests, scheduler_output);
         const auto infer_end = std::chrono::steady_clock::now();
+        const auto& timings = m_model_runner->get_forward_timings();
+        m_pipeline_metrics.forward_input_us = timings.input_us;
+        m_pipeline_metrics.forward_infer_us = timings.infer_us;
+        m_pipeline_metrics.forward_output_us = timings.output_us;
+        m_pipeline_metrics.forward_profiling_us = timings.profiling_us;
+        m_pipeline_metrics.forward_operator_us = timings.operator_us;
+        m_pipeline_metrics.forward_profiled_operations = timings.profiled_operations;
+        m_pipeline_metrics.forward_calls = 1;
         m_pipeline_metrics.inference_duration = PerfMetrics::get_microsec(infer_end - infer_start);
         timer.end();
     }
@@ -822,6 +843,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_step() {
             m_scheduler->has_linear_attention_cache() && m_is_validation_mode_enabled;
         sampler_output = m_sampler->sample(
             m_requests, logits, m_is_validation_mode_enabled, false, defer_sequence_group_updates);
+        m_pipeline_metrics.logits_access_us = sampler_output.logits_access_us;
         m_pipeline_metrics.sampling_duration =
             PerfMetrics::get_microsec(std::chrono::steady_clock::now() - sample_start);
         m_batch_size = sampler_output.num_generated_tokens;

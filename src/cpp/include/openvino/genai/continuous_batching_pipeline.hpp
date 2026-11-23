@@ -61,6 +61,15 @@ struct PipelineMetrics {
      */
     float inference_duration = 0.0;
 
+    double forward_input_us = 0.0;
+    double forward_infer_us = 0.0;
+    double forward_output_us = 0.0;
+    double forward_profiling_us = 0.0;
+    double forward_operator_us = 0.0;
+    size_t forward_profiled_operations = 0;
+    size_t forward_calls = 0;
+    double logits_access_us = 0.0;
+
     /**
      * Duration of the sampling step in the last generation step in microseconds.
      */
@@ -92,6 +101,14 @@ struct PipelineMetrics {
           max_cache_usage{other.max_cache_usage},
           avg_cache_usage{other.avg_cache_usage},
           inference_duration{other.inference_duration},
+          forward_input_us{other.forward_input_us},
+          forward_infer_us{other.forward_infer_us},
+          forward_output_us{other.forward_output_us},
+          forward_profiling_us{other.forward_profiling_us},
+          forward_operator_us{other.forward_operator_us},
+          forward_profiled_operations{other.forward_profiled_operations},
+          forward_calls{other.forward_calls},
+          logits_access_us{other.logits_access_us},
           cache_size_in_bytes{other.cache_size_in_bytes},
           kv_cache_size_in_bytes{cache_size_in_bytes},
           la_peak_pool_blocks{other.la_peak_pool_blocks} {}
@@ -103,6 +120,14 @@ struct PipelineMetrics {
         max_cache_usage = other.max_cache_usage;
         avg_cache_usage = other.avg_cache_usage;
         inference_duration = other.inference_duration;
+        forward_input_us = other.forward_input_us;
+        forward_infer_us = other.forward_infer_us;
+        forward_output_us = other.forward_output_us;
+        forward_profiling_us = other.forward_profiling_us;
+        forward_operator_us = other.forward_operator_us;
+        forward_profiled_operations = other.forward_profiled_operations;
+        forward_calls = other.forward_calls;
+        logits_access_us = other.logits_access_us;
         cache_size_in_bytes = other.cache_size_in_bytes;
         la_peak_pool_blocks = other.la_peak_pool_blocks;
         return *this;
@@ -115,6 +140,14 @@ struct PipelineMetrics {
           max_cache_usage{std::move(other.max_cache_usage)},
           avg_cache_usage{std::move(other.avg_cache_usage)},
           inference_duration{std::move(other.inference_duration)},
+          forward_input_us{other.forward_input_us},
+          forward_infer_us{other.forward_infer_us},
+          forward_output_us{other.forward_output_us},
+          forward_profiling_us{other.forward_profiling_us},
+          forward_operator_us{other.forward_operator_us},
+          forward_profiled_operations{other.forward_profiled_operations},
+          forward_calls{other.forward_calls},
+          logits_access_us{other.logits_access_us},
           cache_size_in_bytes{std::move(other.cache_size_in_bytes)},
           kv_cache_size_in_bytes{cache_size_in_bytes},
           la_peak_pool_blocks{std::move(other.la_peak_pool_blocks)} {}
@@ -126,6 +159,14 @@ struct PipelineMetrics {
         max_cache_usage = std::move(other.max_cache_usage);
         avg_cache_usage = std::move(other.avg_cache_usage);
         inference_duration = std::move(other.inference_duration);
+        forward_input_us = other.forward_input_us;
+        forward_infer_us = other.forward_infer_us;
+        forward_output_us = other.forward_output_us;
+        forward_profiling_us = other.forward_profiling_us;
+        forward_operator_us = other.forward_operator_us;
+        forward_profiled_operations = other.forward_profiled_operations;
+        forward_calls = other.forward_calls;
+        logits_access_us = other.logits_access_us;
         cache_size_in_bytes = std::move(other.cache_size_in_bytes);
         la_peak_pool_blocks = std::move(other.la_peak_pool_blocks);
         return *this;

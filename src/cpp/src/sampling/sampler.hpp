@@ -54,6 +54,7 @@ inline bool is_stop_token_id_hit_in_sequence_group(SequenceGroup::Ptr sequence_g
 std::vector<Token> log_softmax(const ov::Tensor& logits, size_t batch_idx);
 
 struct SamplerOutput {
+    double logits_access_us = 0.0;
     struct AcceptanceResult {
         size_t accepted_depth = 0;
         size_t processed_tokens_after = 0;

@@ -25,6 +25,7 @@ struct ContinuousBatchingPipeline::StagedImpl::Slot {
     std::vector<SequenceGroup::Ptr> sampled_groups;
     SamplerOutput sampler_output;
     float forward_us = 0.0f;
+    ModelRunner::ForwardTimings forward_timings;
     float sampling_us = 0.0f;
     std::exception_ptr error;
 };
@@ -79,6 +80,7 @@ ContinuousBatchingPipeline::StagedImpl::StagedImpl(const std::shared_ptr<ov::Mod
             slot->runner = std::make_shared<ModelRunner>(compiled_model.create_infer_request(),
                                                          m_scheduler->get_block_size(CacheType::KV_CACHE),
                                                          m_num_decoder_layers);
+            slot->runner->set_collect_profiling(m_model_runner->collects_profiling());
             slot->shares_primary_cache = true;
         }
         m_slots.push_back(std::move(slot));
@@ -134,6 +136,7 @@ void ContinuousBatchingPipeline::StagedImpl::_forward_loop() {
             const auto start = std::chrono::steady_clock::now();
             slot->logits = slot->runner->forward(slot->groups, slot->scheduler_output);
             slot->forward_us = PerfMetrics::get_microsec(std::chrono::steady_clock::now() - start);
+            slot->forward_timings = slot->runner->get_forward_timings();
         } catch (...) {
             slot->error = std::current_exception();
         }
@@ -297,6 +300,14 @@ void ContinuousBatchingPipeline::StagedImpl::_commit(Slot& slot) {
 
     m_batch_size += sampler_output.num_generated_tokens;
     m_pipeline_metrics.inference_duration += slot.forward_us;
+    m_pipeline_metrics.forward_input_us += slot.forward_timings.input_us;
+    m_pipeline_metrics.forward_infer_us += slot.forward_timings.infer_us;
+    m_pipeline_metrics.forward_output_us += slot.forward_timings.output_us;
+    m_pipeline_metrics.forward_profiling_us += slot.forward_timings.profiling_us;
+    m_pipeline_metrics.forward_operator_us += slot.forward_timings.operator_us;
+    m_pipeline_metrics.forward_profiled_operations += slot.forward_timings.profiled_operations;
+    ++m_pipeline_metrics.forward_calls;
+    m_pipeline_metrics.logits_access_us += sampler_output.logits_access_us;
     m_pipeline_metrics.sampling_duration += slot.sampling_us;
     slot.groups.clear();
     slot.sampled_groups.clear();
@@ -394,6 +405,14 @@ void ContinuousBatchingPipeline::StagedImpl::step() {
         m_batch_size = 0;
         m_pipeline_metrics.inference_duration = 0.0f;
         m_pipeline_metrics.sampling_duration = 0.0f;
+        m_pipeline_metrics.forward_input_us = 0;
+        m_pipeline_metrics.forward_infer_us = 0;
+        m_pipeline_metrics.forward_output_us = 0;
+        m_pipeline_metrics.forward_profiling_us = 0;
+        m_pipeline_metrics.forward_operator_us = 0;
+        m_pipeline_metrics.forward_profiled_operations = 0;
+        m_pipeline_metrics.forward_calls = 0;
+        m_pipeline_metrics.logits_access_us = 0;
 
         _pull_awaiting_requests();
         const bool committed = _commit_done_slots();

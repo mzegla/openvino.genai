@@ -21,6 +21,7 @@
 
 #include <cxxopts.hpp>
 
+#include "openvino/runtime/properties.hpp"
 #include "openvino/genai/continuous_batching_pipeline.hpp"
 #include "openvino/genai/generation_handle.hpp"
 #include "openvino/genai/tokenizer.hpp"
@@ -53,6 +54,14 @@ struct RunResult {
     // time the engine had no requests and waited for the next arrival
     double idle_s = 0.0;
     double forward_s = 0.0;
+    double input_us = 0.0;
+    double infer_us = 0.0;
+    double output_us = 0.0;
+    double profiling_us = 0.0;
+    double operator_us = 0.0;
+    double logits_access_us = 0.0;
+    size_t profiled_operations = 0;
+    size_t forward_calls = 0;
     size_t num_steps = 0;
     std::vector<double> ttft_ms;
     std::vector<double> inter_token_ms;
@@ -257,7 +266,16 @@ RunResult run_workload(ov::genai::ContinuousBatchingPipeline& pipe,
         if (pipe.has_non_finished_requests()) {
             pipe.step();
             ++result.num_steps;
-            result.forward_s += pipe.get_metrics().inference_duration / 1e6;
+            const auto metrics = pipe.get_metrics();
+            result.forward_s += metrics.inference_duration / 1e6;
+            result.input_us += metrics.forward_input_us;
+            result.infer_us += metrics.forward_infer_us;
+            result.output_us += metrics.forward_output_us;
+            result.profiling_us += metrics.forward_profiling_us;
+            result.operator_us += metrics.forward_operator_us;
+            result.logits_access_us += metrics.logits_access_us;
+            result.profiled_operations += metrics.forward_profiled_operations;
+            result.forward_calls += metrics.forward_calls;
             drain();
             continue;
         }
@@ -337,6 +355,7 @@ int main(int argc, char* argv[]) try {
     ("engines", "Comma separated engines to run: baseline, serial, split", cxxopts::value<std::string>()->default_value("baseline,serial,split"))
     ("b,max_batch_size", "A maximum number of batched tokens", cxxopts::value<size_t>()->default_value("256"))
     ("cache_size", "Size of memory used for KV cache in GB", cxxopts::value<size_t>()->default_value("2"))
+    ("profile", "Enable OpenVINO operator profiling (may affect performance)", cxxopts::value<bool>()->default_value("false"))
     ("warmup", "Run the workload once, with every request submitted at the start, before the measured run", cxxopts::value<bool>()->default_value("true"))
     ("h,help", "Print usage");
 
@@ -357,6 +376,7 @@ int main(int argc, char* argv[]) try {
     const size_t num_requests = args["num_requests"].as<size_t>();
     const std::vector<std::string> engines = split(args["engines"].as<std::string>(), ',');
     const bool warmup = args["warmup"].as<bool>();
+    const bool profile = args["profile"].as<bool>();
     const double request_rate = args["request_rate"].as<double>();
     const bool is_dynamic = request_rate > 0.0;
     const size_t prompt_repeat = std::max<size_t>(args["prompt_repeat"].as<size_t>(), 1);
@@ -405,6 +425,9 @@ int main(int argc, char* argv[]) try {
     bool workload_sizes_printed = false;
     for (const std::string& engine : engines) {
         ov::AnyMap properties;
+        if (profile) {
+            properties[ov::enable_profiling.name()] = true;
+        }
         if (engine != "baseline") {
             properties["staged_engine"] = engine;
         }
@@ -480,6 +503,45 @@ int main(int argc, char* argv[]) try {
               << std::endl
               << "exact match: requests whose generated token ids are identical to the baseline engine. Not compared"
               << " with --request_rate, where batches depend on timing." << std::endl;
+
+    std::cout << "\nForward breakdown (mean milliseconds per forward):\n"
+              << std::left << std::setw(10) << "engine" << std::right << std::setw(9) << "calls"
+              << std::setw(12) << "input" << std::setw(12) << "infer" << std::setw(12) << "output"
+              << std::setw(14) << "logits data" << std::setw(14) << "profile read"
+              << std::setw(14) << "op sum" << std::setw(12) << "op/infer %" << std::endl;
+    for (size_t i = 0; i < engines.size(); ++i) {
+        const auto& result = results[i];
+        const double divisor = result.forward_calls ? 1000.0 * result.forward_calls : 1.0;
+        std::cout << std::left << std::setw(10) << engines[i] << std::right << std::fixed << std::setprecision(3)
+                  << std::setw(9) << result.forward_calls << std::setw(12) << result.input_us / divisor
+                  << std::setw(12) << result.infer_us / divisor << std::setw(12) << result.output_us / divisor
+                  << std::setw(14) << result.logits_access_us / divisor << std::setw(14) << result.profiling_us / divisor;
+        if (result.profiled_operations && result.infer_us > 0) {
+            std::cout << std::setw(14) << result.operator_us / divisor << std::setw(12)
+                      << 100.0 * result.operator_us / result.infer_us;
+        } else {
+            std::cout << std::setw(14) << "n/a" << std::setw(12) << "n/a";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << "\nForward breakdown (percentage of measured forward time):\n"
+              << std::left << std::setw(10) << "engine" << std::right << std::setw(12) << "input %"
+              << std::setw(12) << "infer %" << std::setw(12) << "output %" << std::setw(16) << "profile read %"
+              << std::endl;
+    for (size_t i = 0; i < engines.size(); ++i) {
+        const auto& result = results[i];
+        const double forward_us = result.forward_s * 1e6;
+        const double scale = forward_us > 0 ? 100.0 / forward_us : 0.0;
+        std::cout << std::left << std::setw(10) << engines[i] << std::right << std::fixed << std::setprecision(2)
+                  << std::setw(12) << result.input_us * scale << std::setw(12) << result.infer_us * scale
+                  << std::setw(12) << result.output_us * scale << std::setw(16) << result.profiling_us * scale
+                  << std::endl;
+    }
+    std::cout << "input/output: host-side preparation and output handling; logits data: sampler data() access outside forward.\n"
+              << "infer: blocking infer() wall time, including plugin overhead and any transfers.\n"
+              << "op sum: sum of EXECUTED operator real_time from OpenVINO profiling, not GPU busy wall time; "
+              << "overlap or missing operations can make the ratio misleading.\n"
+              << "profile read: host time retrieving profiling info. Profiling may change performance.\n";
 
     if (!serial_matches) {
         std::cout << "FAILED: the serial staged engine must reproduce the baseline token ids" << std::endl;

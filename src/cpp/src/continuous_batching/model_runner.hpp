@@ -377,7 +377,20 @@ struct NgramEmbeddingsContext {
  * KV cache block indices etc.) and returning the logit scores for the next token to be generated for each of the currently scheduled sequences.
  */
 class ModelRunner {
+public:
+    struct ForwardTimings {
+        double input_us = 0;
+        double infer_us = 0;
+        double output_us = 0;
+        double profiling_us = 0;
+        double operator_us = 0;
+        size_t profiled_operations = 0;
+    };
+
+private:
     ov::InferRequest m_request;
+    ForwardTimings m_forward_timings;
+    bool m_collect_profiling = false;
     AttentionScoresForEachSubsequence m_last_attention_scores;
     BlockDiversityForEachSubsequence m_last_block_diversities;
     size_t m_block_size;
@@ -522,6 +535,10 @@ public:
         return m_request;
     }
 
+    void set_collect_profiling(bool enabled) { m_collect_profiling = enabled; }
+    bool collects_profiling() const { return m_collect_profiling; }
+    const ForwardTimings& get_forward_timings() const { return m_forward_timings; }
+
     void enable_hidden_state_export(bool on)   { on ? m_hidden_state_flags |= HS_EXPORT   : m_hidden_state_flags &= ~HS_EXPORT; }
     void enable_hidden_state_import(bool on)   { on ? m_hidden_state_flags |= HS_IMPORT   : m_hidden_state_flags &= ~HS_IMPORT; }
     void enable_hidden_state_internal(bool on) { on ? m_hidden_state_flags |= HS_INTERNAL : m_hidden_state_flags &= ~HS_INTERNAL; }
@@ -589,6 +606,8 @@ public:
      * @return An ov::Tensor with next-token logit scores for each sequence processed during this `forward` call.
      */
     ov::Tensor forward(const std::vector<SequenceGroup::Ptr> & sequence_groups, const ContinuousBatchingScheduler::Output& scheduler_output) {
+        const auto forward_start = std::chrono::steady_clock::now();
+        m_forward_timings = {};
         m_sequence_hidden_state_mapping.clear();
         size_t num_sequence_groups = scheduler_output.m_scheduled_sequence_groups_ids.size();
 
@@ -1130,12 +1149,16 @@ public:
             m_request.set_tensor("score_aggregation_window", score_aggregation_window);
         }
 
+        const auto infer_start = std::chrono::steady_clock::now();
+        m_forward_timings.input_us = PerfMetrics::get_microsec(infer_start - forward_start);
         {
             static ManualTimer timer("pure generate inference");
             timer.start();
             m_request.infer();
             timer.end();
         }
+        const auto infer_end = std::chrono::steady_clock::now();
+        m_forward_timings.infer_us = PerfMetrics::get_microsec(infer_end - infer_start);
 
         if (m_collect_attention_scores) {
             _collect_attention_scores(sequence_groups, scheduler_output);
@@ -1195,8 +1218,20 @@ public:
                 }
             }
         }
-        // return logits
-        return m_request.get_tensor("logits");
+        ov::Tensor logits = m_request.get_tensor("logits");
+        const auto output_end = std::chrono::steady_clock::now();
+        m_forward_timings.output_us = PerfMetrics::get_microsec(output_end - infer_end);
+        if (m_collect_profiling) {
+            for (const auto& operation : m_request.get_profiling_info()) {
+                if (operation.status == ov::ProfilingInfo::Status::EXECUTED) {
+                    m_forward_timings.operator_us += operation.real_time.count();
+                    ++m_forward_timings.profiled_operations;
+                }
+            }
+            m_forward_timings.profiling_us =
+                PerfMetrics::get_microsec(std::chrono::steady_clock::now() - output_end);
+        }
+        return logits;
     }
 
     bool _has_missing_generated_embeddings(const std::vector<SequenceGroup::Ptr>& sequence_groups,

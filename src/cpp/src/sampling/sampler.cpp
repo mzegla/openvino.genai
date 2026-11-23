@@ -1798,7 +1798,9 @@ SamplerOutput Sampler::sample(const std::vector<SequenceGroup::Ptr> & sequence_g
                               bool is_validation_mode_enabled,
                               bool notify_handles,
                               bool defer_sequence_group_updates) {
+    const auto logits_access_start = std::chrono::steady_clock::now();
     const float * logits_data = logits.data<float>();
+    const auto logits_access_end = std::chrono::steady_clock::now();
     ov::Shape logits_shape = logits.get_shape();
     OPENVINO_ASSERT(logits_shape.size() == 3);
     size_t vocab_size = logits_shape[2];
@@ -1810,6 +1812,7 @@ SamplerOutput Sampler::sample(const std::vector<SequenceGroup::Ptr> & sequence_g
                     " draft logits.");
 
     SamplerOutput sampler_output;
+    sampler_output.logits_access_us = PerfMetrics::get_microsec(logits_access_end - logits_access_start);
     std::unordered_map<uint64_t, std::future<SequenceGroupSamplingInfo>> sg_sampling_future_map;
     struct SamplingFuturesWaiter {
         std::unordered_map<uint64_t, std::future<SequenceGroupSamplingInfo>>& futures;
